@@ -1,0 +1,248 @@
+package config
+
+import (
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestLoadTagsFileSupportsNewlines(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile(".tags", []byte("one\ntwo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_TAG", "")
+	t.Setenv("PLUGIN_TAGS", "")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"one", "two"}; !reflect.DeepEqual(cfg.Tags, want) {
+		t.Fatalf("tags = %#v, want %#v", cfg.Tags, want)
+	}
+}
+
+func TestLoadBuildOnlyStillRequiresRepo(t *testing.T) {
+	t.Setenv("PLUGIN_NO_PUSH", "true")
+	t.Setenv("PLUGIN_REPO", "")
+	_, err := Load("docker")
+	if err == nil || !strings.Contains(err.Error(), "PLUGIN_REPO or PLUGIN_DESTINATIONS is required") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadAcceptsNativeDestinationsWithoutRepo(t *testing.T) {
+	t.Setenv("PLUGIN_DESTINATIONS", "registry.example/team/app:one;registry.example/team/app:two")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"registry.example/team/app:one", "registry.example/team/app:two"}
+	if !reflect.DeepEqual(cfg.Destinations, want) {
+		t.Fatalf("destinations = %#v, want %#v", cfg.Destinations, want)
+	}
+}
+
+func TestNativeDestinationsBypassUnrelatedTagResolution(t *testing.T) {
+	t.Setenv("PLUGIN_DESTINATIONS", "registry.example/team/app:one")
+	t.Setenv("PLUGIN_AUTO_TAG", "true")
+	t.Setenv("PLUGIN_EXPAND_TAG", "true")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Tags) != 0 {
+		t.Fatalf("native destinations unexpectedly resolved tags: %#v", cfg.Tags)
+	}
+}
+
+func TestNativeDestinationsRejectRepositoryMode(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_DESTINATIONS", "registry.example/team/app:one")
+	_, err := Load("docker")
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestCloudProviderDoesNotUseBaseDockerRegistryAsDestination(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "team/app")
+	t.Setenv("DOCKER_REGISTRY", "base-images.example")
+	cfg, err := Load("ecr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Registry != "" {
+		t.Fatalf("cloud destination registry = %q, want empty", cfg.Registry)
+	}
+}
+
+func TestDockerProviderKeepsDockerRegistryDestinationAlias(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "team/app")
+	t.Setenv("DOCKER_REGISTRY", "push.example")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Registry != "push.example" {
+		t.Fatalf("Docker destination registry = %q", cfg.Registry)
+	}
+}
+
+func TestLoadTarPathMustBeUnderKimiaHome(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_TAR_PATH", "/tmp/app.tar")
+	_, err := Load("docker")
+	if err == nil || !strings.Contains(err.Error(), "under /home/kimia") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadCacheConflict(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_ENABLE_CACHE", "true")
+	t.Setenv("PLUGIN_NO_CACHE", "true")
+	_, err := Load("docker")
+	if err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestUnsupportedFalseIsIgnored(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_SQUASH", "false")
+	if _, err := Load("docker"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadCacheFromIsCommaDelimited(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_CACHE_FROM", "example/cache:one,example/cache:two")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"type=registry,ref=example/cache:one", "type=registry,ref=example/cache:two"}
+	if !reflect.DeepEqual(cfg.ImportCache, want) {
+		t.Fatalf("cache imports = %#v, want %#v", cfg.ImportCache, want)
+	}
+}
+
+func TestLoadBuildxCacheSpecPreservesCommas(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_CACHE_FROM", "type=registry,ref=example/cache,mode=max;type=local,src=/cache")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"type=registry,ref=example/cache,mode=max", "type=local,src=/cache"}
+	if !reflect.DeepEqual(cfg.ImportCache, want) {
+		t.Fatalf("cache imports = %#v, want %#v", cfg.ImportCache, want)
+	}
+}
+
+func TestLoadBuildArgsFromEnvironmentSkipsEmptyAndUsesHarnessAlias(t *testing.T) {
+	clearProxyEnvironment(t)
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_BUILD_ARGS_FROM_ENV", "missing,token")
+	t.Setenv("HARNESS_TOKEN", "value")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"token=value"}; !reflect.DeepEqual(cfg.BuildArgs, want) {
+		t.Fatalf("build args = %#v, want %#v", cfg.BuildArgs, want)
+	}
+}
+
+func TestBuildArgEnvironmentDoesNotOverrideExplicitValue(t *testing.T) {
+	clearProxyEnvironment(t)
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_BUILD_ARGS", "TOKEN=explicit")
+	t.Setenv("PLUGIN_BUILD_ARGS_FROM_ENV", "TOKEN")
+	t.Setenv("TOKEN", "environment")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"TOKEN=explicit"}; !reflect.DeepEqual(cfg.BuildArgs, want) {
+		t.Fatalf("build args = %#v, want %#v", cfg.BuildArgs, want)
+	}
+}
+
+func clearProxyEnvironment(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"http_proxy", "HTTP_PROXY", "HARNESS_HTTP_PROXY",
+		"https_proxy", "HTTPS_PROXY", "HARNESS_HTTPS_PROXY",
+		"no_proxy", "NO_PROXY", "HARNESS_NO_PROXY",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func TestHarnessCAPathIsIgnored(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("HARNESS_CA_PATH", "/platform/injected/ca.pem")
+	if _, err := Load("docker"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlatformMetadataEnvironmentIsIgnored(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("DRONE_REPO_LINK", "https://example.invalid/team/repo")
+	t.Setenv("DRONE_CARD_PATH", "/harness/card.json")
+	if _, err := Load("docker"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIneffectiveBuildKitInputIsRejected(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_STORAGE_DRIVER", "overlay")
+	_, err := Load("docker")
+	if err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestSigningRequiresPushedAttestation(t *testing.T) {
+	tests := []struct {
+		name        string
+		noPush      string
+		tarPath     string
+		attestation string
+	}{
+		{name: "build only", noPush: "true", attestation: "sbom"},
+		{name: "tar export", tarPath: "/home/kimia/output/app.tar", attestation: "sbom"},
+		{name: "attestation disabled", attestation: "off"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("PLUGIN_REPO", "example/app")
+			t.Setenv("PLUGIN_SIGN", "true")
+			t.Setenv("PLUGIN_COSIGN_KEY", "key")
+			t.Setenv("PLUGIN_ATTESTATION", test.attestation)
+			t.Setenv("PLUGIN_NO_PUSH", test.noPush)
+			t.Setenv("PLUGIN_TAR_PATH", test.tarPath)
+			_, err := Load("docker")
+			if err == nil {
+				t.Fatal("Load() accepted a signing mode that cannot produce a signature")
+			}
+		})
+	}
+}
+
+func TestCosignInputsRequireSigning(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_COSIGN_PASSWORD_ENV", "AWS_SECRET_ACCESS_KEY")
+	_, err := Load("docker")
+	if err == nil || !strings.Contains(err.Error(), "PLUGIN_SIGN=true") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}

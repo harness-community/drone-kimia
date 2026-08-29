@@ -1,0 +1,371 @@
+pipeline:
+  identifier: dronekimiaharness
+  name: drone-kimia-harness
+  projectIdentifier: Drone_Plugins
+  orgIdentifier: default
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: GitHub_Drone_Org
+        repoName: drone-kimia
+        build: <+input>
+        sparseCheckout: []
+  stages:
+    - parallel:
+        - stage:
+            name: linux-amd64
+            identifier: linuxamd64
+            description: Build, test, and publish the amd64 Kimia plugin images
+            type: CI
+            spec:
+              cloneCodebase: true
+              caching:
+                enabled: false
+                paths: []
+              platform:
+                os: Linux
+                arch: Amd64
+              runtime:
+                type: Cloud
+                spec: {}
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: Build and Test
+                      identifier: Build_and_Test
+                      spec:
+                        connectorRef: Plugins_Docker_Hub_Connector
+                        image: golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514
+                        shell: Sh
+                        envVariables:
+                          PLUGIN_VERSION: <+codebase.tag>
+                          PLUGIN_COMMIT: <+codebase.commitSha>
+                          PLUGIN_BUILD_DATE: <+pipeline.startTs>
+                        command: |-
+                          go test -mod=readonly ./...
+                          case "${PLUGIN_VERSION:-}" in ""|null) PLUGIN_VERSION=dev ;; esac
+                          case "${PLUGIN_COMMIT:-}" in ""|null) PLUGIN_COMMIT=unknown ;; esac
+                          case "${PLUGIN_BUILD_DATE:-}" in ""|null) PLUGIN_BUILD_DATE=unknown ;; esac
+                          export PLUGIN_VERSION PLUGIN_COMMIT PLUGIN_BUILD_DATE
+                          KIMIA_BUILD_ARCHES=amd64 sh scripts/build.sh
+                          release/linux/amd64/kimia-docker --version
+                          release/linux/amd64/kimia-gar --version
+                          release/linux/amd64/kimia-ecr --version
+                          release/linux/amd64/kimia-acr --version
+                  - step:
+                      type: Plugin
+                      name: Build and Push Tag
+                      identifier: BuildAndPushTag
+                      spec:
+                        connectorRef: Plugins_Docker_Hub_Connector
+                        image: plugins/docker@sha256:f0233d950ae87ee6cb5500b2d5497fe02aa338201c0bdce2619f443fd174cfa4
+                        settings:
+                          username: drone
+                          password: <+secrets.getValue("Plugins_Docker_Hub_Pat")>
+                          repo: plugins/kimia<+matrix.image>
+                          dockerfile: docker/<+matrix.repo>/Dockerfile.linux.amd64
+                          auto_tag: "true"
+                          auto_tag_suffix: linux-amd64
+                          daemon_off: "false"
+                          build_args:
+                            - PLUGIN_VERSION=<+codebase.tag>
+                            - PLUGIN_REVISION=<+codebase.commitSha>
+                            - PLUGIN_CREATED=<+pipeline.startTs>
+                      when:
+                        stageStatus: Success
+                        condition: <+codebase.build.type> == "tag"
+                      strategy:
+                        matrix:
+                          image:
+                            - ""
+                            - "-gar"
+                            - "-ecr"
+                            - "-acr"
+                          repo:
+                            - docker
+                            - gar
+                            - ecr
+                            - acr
+                          exclude:
+                            - image: ""
+                              repo: gar
+                            - image: ""
+                              repo: ecr
+                            - image: ""
+                              repo: acr
+                            - image: "-gar"
+                              repo: docker
+                            - image: "-gar"
+                              repo: ecr
+                            - image: "-gar"
+                              repo: acr
+                            - image: "-ecr"
+                              repo: docker
+                            - image: "-ecr"
+                              repo: gar
+                            - image: "-ecr"
+                              repo: acr
+                            - image: "-acr"
+                              repo: docker
+                            - image: "-acr"
+                              repo: gar
+                            - image: "-acr"
+                              repo: ecr
+                          nodeName: tag_<+matrix.repo>
+                  - step:
+                      type: BuildAndPushDockerRegistry
+                      name: Build and Push Branch
+                      identifier: BuildAndPushBranch
+                      spec:
+                        connectorRef: Plugins_Docker_Hub_Connector
+                        repo: plugins/kimia<+matrix.image>
+                        tags:
+                          - linux-amd64
+                        caching: false
+                        dockerfile: docker/<+matrix.repo>/Dockerfile.linux.amd64
+                      when:
+                        stageStatus: Success
+                        condition: <+codebase.build.type> == "branch"
+                      strategy:
+                        matrix:
+                          image:
+                            - ""
+                            - "-gar"
+                            - "-ecr"
+                            - "-acr"
+                          repo:
+                            - docker
+                            - gar
+                            - ecr
+                            - acr
+                          exclude:
+                            - image: ""
+                              repo: gar
+                            - image: ""
+                              repo: ecr
+                            - image: ""
+                              repo: acr
+                            - image: "-gar"
+                              repo: docker
+                            - image: "-gar"
+                              repo: ecr
+                            - image: "-gar"
+                              repo: acr
+                            - image: "-ecr"
+                              repo: docker
+                            - image: "-ecr"
+                              repo: gar
+                            - image: "-ecr"
+                              repo: acr
+                            - image: "-acr"
+                              repo: docker
+                            - image: "-acr"
+                              repo: gar
+                            - image: "-acr"
+                              repo: ecr
+                          nodeName: branch_<+matrix.repo>
+            when:
+              pipelineStatus: Success
+        - stage:
+            name: linux-arm64
+            identifier: linuxarm64
+            description: Build, test, and publish the arm64 Kimia plugin images
+            type: CI
+            spec:
+              cloneCodebase: true
+              caching:
+                enabled: false
+                paths: []
+              platform:
+                os: Linux
+                arch: Arm64
+              runtime:
+                type: Cloud
+                spec: {}
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: Build and Test
+                      identifier: Build_and_Test
+                      spec:
+                        connectorRef: Plugins_Docker_Hub_Connector
+                        image: golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514
+                        shell: Sh
+                        envVariables:
+                          PLUGIN_VERSION: <+codebase.tag>
+                          PLUGIN_COMMIT: <+codebase.commitSha>
+                          PLUGIN_BUILD_DATE: <+pipeline.startTs>
+                        command: |-
+                          go test -mod=readonly ./...
+                          case "${PLUGIN_VERSION:-}" in ""|null) PLUGIN_VERSION=dev ;; esac
+                          case "${PLUGIN_COMMIT:-}" in ""|null) PLUGIN_COMMIT=unknown ;; esac
+                          case "${PLUGIN_BUILD_DATE:-}" in ""|null) PLUGIN_BUILD_DATE=unknown ;; esac
+                          export PLUGIN_VERSION PLUGIN_COMMIT PLUGIN_BUILD_DATE
+                          KIMIA_BUILD_ARCHES=arm64 sh scripts/build.sh
+                          release/linux/arm64/kimia-docker --version
+                          release/linux/arm64/kimia-gar --version
+                          release/linux/arm64/kimia-ecr --version
+                          release/linux/arm64/kimia-acr --version
+                  - step:
+                      type: Plugin
+                      name: Build and Push Tag
+                      identifier: BuildAndPushTag
+                      spec:
+                        connectorRef: Plugins_Docker_Hub_Connector
+                        image: plugins/docker@sha256:f0233d950ae87ee6cb5500b2d5497fe02aa338201c0bdce2619f443fd174cfa4
+                        settings:
+                          username: drone
+                          password: <+secrets.getValue("Plugins_Docker_Hub_Pat")>
+                          repo: plugins/kimia<+matrix.image>
+                          dockerfile: docker/<+matrix.repo>/Dockerfile.linux.arm64
+                          auto_tag: "true"
+                          auto_tag_suffix: linux-arm64
+                          daemon_off: "false"
+                          build_args:
+                            - PLUGIN_VERSION=<+codebase.tag>
+                            - PLUGIN_REVISION=<+codebase.commitSha>
+                            - PLUGIN_CREATED=<+pipeline.startTs>
+                      when:
+                        stageStatus: Success
+                        condition: <+codebase.build.type> == "tag"
+                      strategy:
+                        matrix:
+                          image:
+                            - ""
+                            - "-gar"
+                            - "-ecr"
+                            - "-acr"
+                          repo:
+                            - docker
+                            - gar
+                            - ecr
+                            - acr
+                          exclude:
+                            - image: ""
+                              repo: gar
+                            - image: ""
+                              repo: ecr
+                            - image: ""
+                              repo: acr
+                            - image: "-gar"
+                              repo: docker
+                            - image: "-gar"
+                              repo: ecr
+                            - image: "-gar"
+                              repo: acr
+                            - image: "-ecr"
+                              repo: docker
+                            - image: "-ecr"
+                              repo: gar
+                            - image: "-ecr"
+                              repo: acr
+                            - image: "-acr"
+                              repo: docker
+                            - image: "-acr"
+                              repo: gar
+                            - image: "-acr"
+                              repo: ecr
+                          nodeName: tag_<+matrix.repo>
+                  - step:
+                      type: BuildAndPushDockerRegistry
+                      name: Build and Push Branch
+                      identifier: BuildAndPushBranch
+                      spec:
+                        connectorRef: Plugins_Docker_Hub_Connector
+                        repo: plugins/kimia<+matrix.image>
+                        tags:
+                          - linux-arm64
+                        caching: false
+                        dockerfile: docker/<+matrix.repo>/Dockerfile.linux.arm64
+                      when:
+                        stageStatus: Success
+                        condition: <+codebase.build.type> == "branch"
+                      strategy:
+                        matrix:
+                          image:
+                            - ""
+                            - "-gar"
+                            - "-ecr"
+                            - "-acr"
+                          repo:
+                            - docker
+                            - gar
+                            - ecr
+                            - acr
+                          exclude:
+                            - image: ""
+                              repo: gar
+                            - image: ""
+                              repo: ecr
+                            - image: ""
+                              repo: acr
+                            - image: "-gar"
+                              repo: docker
+                            - image: "-gar"
+                              repo: ecr
+                            - image: "-gar"
+                              repo: acr
+                            - image: "-ecr"
+                              repo: docker
+                            - image: "-ecr"
+                              repo: gar
+                            - image: "-ecr"
+                              repo: acr
+                            - image: "-acr"
+                              repo: docker
+                            - image: "-acr"
+                              repo: gar
+                            - image: "-acr"
+                              repo: ecr
+                          nodeName: branch_<+matrix.repo>
+            when:
+              pipelineStatus: Success
+    - stage:
+        name: Manifest and Release
+        identifier: Manifest
+        description: Publish multi-architecture manifests for the four Kimia plugin images
+        type: CI
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: false
+            paths: []
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Plugin
+                  name: Manifest
+                  identifier: Manifest
+                  spec:
+                    connectorRef: Plugins_Docker_Hub_Connector
+                    image: plugins/manifest@sha256:2dcbc931c93f2ceb8764fe246a02bc7f19044372a9a55c264fc6b0eafd928774
+                    settings:
+                      auto_tag: "true"
+                      spec: docker/<+matrix.repo>/manifest.tmpl
+                      username: drone
+                      password: <+secrets.getValue("Plugins_Docker_Hub_Pat")>
+                      ignore_missing: "false"
+                  when:
+                    stageStatus: Success
+                    condition: <+codebase.build.type> == "branch" || <+codebase.build.type> == "tag"
+                  strategy:
+                    matrix:
+                      repo:
+                        - docker
+                        - gar
+                        - ecr
+                        - acr
+                      nodeName: manifest_<+matrix.repo>
+        when:
+          pipelineStatus: Success
+          condition: <+codebase.build.type> == "branch" || <+codebase.build.type> == "tag"
+  allowStageExecutions: true
