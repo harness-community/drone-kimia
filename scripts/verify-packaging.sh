@@ -141,7 +141,12 @@ require_contains .harness/harness.yaml "repoName: drone-kimia"
 require_contains .harness/harness.yaml "image: ${GO_IMAGE}"
 require_contains .harness/harness.yaml "image: ${DOCKER_PLUGIN_IMAGE}"
 require_contains .harness/harness.yaml "image: ${MANIFEST_PLUGIN_IMAGE}"
-require_contains .harness/harness.yaml 'repo: plugins/kimia<+matrix.image>'
+require_contains .harness/harness.yaml 'repo: plugins/kimia'
+require_contains .harness/harness.yaml 'dockerfile: docker/docker/Dockerfile.linux.amd64'
+require_contains .harness/harness.yaml 'dockerfile: docker/docker/Dockerfile.linux.arm64'
+require_contains .harness/harness.yaml 'repo: plugins/kimia-<+matrix.provider>'
+require_contains .harness/harness.yaml 'dockerfile: docker/<+matrix.provider>/Dockerfile.linux.amd64'
+require_contains .harness/harness.yaml 'dockerfile: docker/<+matrix.provider>/Dockerfile.linux.arm64'
 require_contains .harness/harness.yaml 'spec: docker/<+matrix.repo>/manifest.tmpl'
 require_contains .harness/harness.yaml 'password: <+secrets.getValue("Plugins_Docker_Hub_Pat")>'
 require_contains .harness/harness.yaml 'PLUGIN_VERSION: <+codebase.tag>'
@@ -151,6 +156,15 @@ require_contains .harness/harness.yaml 'PLUGIN_VERSION=<+codebase.tag>'
 require_contains .harness/harness.yaml 'PLUGIN_REVISION=<+codebase.commitSha>'
 require_contains .harness/harness.yaml 'PLUGIN_CREATED=<+pipeline.startTs>'
 require_contains .harness/harness.yaml 'ignore_missing: "false"'
+
+if grep -Fq -- '<+matrix.image>' .harness/harness.yaml; then
+	fail '.harness/harness.yaml must not use the cross-product image/repo publish matrix'
+fi
+if grep -Fq -- 'exclude:' .harness/harness.yaml; then
+	fail '.harness/harness.yaml must not pair release repositories through matrix exclusions'
+fi
+matrix_concurrency_count=$(grep -c 'maxConcurrency: 1' .harness/harness.yaml)
+[ "${matrix_concurrency_count}" -eq 5 ] || fail '.harness/harness.yaml must serialize all five release matrices'
 
 for unsupported_harness_variant in gcr kaniko1.9.1 rf-plugins harnesssecure; do
 	if grep -Fiq -- "${unsupported_harness_variant}" .harness/harness.yaml; then
@@ -205,16 +219,16 @@ harness_matrix_value_total() {
 	' .harness/harness.yaml
 }
 
-[ "$(harness_matrix_value_total image)" -eq 16 ] || fail ".harness/harness.yaml must have four image suffixes in each of four publish matrices"
-for image_suffix in "" -gar -ecr -acr; do
-	[ "$(harness_matrix_value_count image "${image_suffix}")" -eq 4 ] \
-		|| fail ".harness/harness.yaml must include image suffix '${image_suffix}' exactly four times"
+[ "$(harness_matrix_value_total provider)" -eq 12 ] || fail ".harness/harness.yaml must have three providers in each of four serialized publish matrices"
+for provider in gar ecr acr; do
+	[ "$(harness_matrix_value_count provider "${provider}")" -eq 4 ] \
+		|| fail ".harness/harness.yaml must include provider '${provider}' exactly four times"
 done
 
-[ "$(harness_matrix_value_total repo)" -eq 20 ] || fail ".harness/harness.yaml must have four provider directories in four publish matrices and the manifest matrix"
+[ "$(harness_matrix_value_total repo)" -eq 4 ] || fail ".harness/harness.yaml must have four provider directories in the manifest matrix"
 for provider_directory in docker gar ecr acr; do
-	[ "$(harness_matrix_value_count repo "${provider_directory}")" -eq 5 ] \
-		|| fail ".harness/harness.yaml must include provider directory '${provider_directory}' exactly five times"
+	[ "$(harness_matrix_value_count repo "${provider_directory}")" -eq 1 ] \
+		|| fail ".harness/harness.yaml must include manifest provider directory '${provider_directory}' exactly once"
 done
 
 for event_file in eventPR eventPush eventTag; do
