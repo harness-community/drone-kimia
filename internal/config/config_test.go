@@ -91,11 +91,48 @@ func TestDockerProviderKeepsDockerRegistryDestinationAlias(t *testing.T) {
 	}
 }
 
-func TestLoadTarPathMustBeUnderKimiaHome(t *testing.T) {
+func TestLoadAcceptsRelativeHarnessTarPath(t *testing.T) {
 	t.Setenv("PLUGIN_REPO", "example/app")
-	t.Setenv("PLUGIN_TAR_PATH", "/tmp/app.tar")
+	t.Setenv("PLUGIN_DESTINATION_TAR_PATH", "imageci.tar")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TarPath != "imageci.tar" {
+		t.Fatalf("tar path = %q", cfg.TarPath)
+	}
+}
+
+func TestLoadPushOnly(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_TAGS", "test")
+	t.Setenv("PLUGIN_PUSH_ONLY", "true")
+	t.Setenv("PLUGIN_SOURCE_TAR_PATH", "imageci.tar")
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.PushOnly || cfg.SourceTarPath != "imageci.tar" {
+		t.Fatalf("unexpected push-only config: %#v", cfg)
+	}
+}
+
+func TestLoadPushOnlyRequiresSourceTar(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_PUSH_ONLY", "true")
 	_, err := Load("docker")
-	if err == nil || !strings.Contains(err.Error(), "under /home/kimia") {
+	if err == nil || !strings.Contains(err.Error(), "PLUGIN_SOURCE_TAR_PATH is required") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadRejectsPushOnlyWithNoPush(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_PUSH_ONLY", "true")
+	t.Setenv("PLUGIN_SOURCE_TAR_PATH", "imageci.tar")
+	t.Setenv("PLUGIN_NO_PUSH", "true")
+	_, err := Load("docker")
+	if err == nil || !strings.Contains(err.Error(), "conflicts") {
 		t.Fatalf("Load() error = %v", err)
 	}
 }

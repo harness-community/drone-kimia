@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/harness-community/drone-kimia/internal/archivepush"
 	"github.com/harness-community/drone-kimia/internal/auth"
 	"github.com/harness-community/drone-kimia/internal/config"
 	"github.com/harness-community/drone-kimia/internal/destination"
@@ -79,6 +80,305 @@ done
 	}
 	if !strings.Contains(string(output), "sha256:abc123") {
 		t.Fatalf("unexpected DRONE_OUTPUT: %s", output)
+	}
+}
+
+func TestRunPushOnlyUsesArchivePublisherAndWritesResults(t *testing.T) {
+	temporary := t.TempDir()
+	sourceTar := filepath.Join(temporary, "imageci.tar")
+	if err := os.WriteFile(sourceTar, []byte("archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousPush := pushImageArchive
+	t.Cleanup(func() { pushImageArchive = previousPush })
+	var received archivepush.Options
+	pushImageArchive = func(ctx context.Context, options archivepush.Options) (string, error) {
+		received = options
+		return "sha256:pushed", nil
+	}
+
+	artifactPath := filepath.Join(temporary, "artifact.json")
+	outputPath := filepath.Join(temporary, "output.env")
+	t.Setenv("DOCKER_CONFIG", filepath.Join(temporary, "docker"))
+	t.Setenv("PLUGIN_REPO", "registry.example/team/app")
+	t.Setenv("PLUGIN_TAGS", "test,latest")
+	t.Setenv("PLUGIN_PUSH_ONLY", "true")
+	t.Setenv("PLUGIN_SOURCE_TAR_PATH", sourceTar)
+	t.Setenv("PLUGIN_ARTIFACT_FILE", artifactPath)
+	t.Setenv("DRONE_OUTPUT", outputPath)
+	t.Setenv("PLUGIN_SNAPSHOT_MODE", "redo")
+	clearProxyEnvironment(t)
+
+	if err := Run(context.Background(), "docker", Streams{}); err != nil {
+		t.Fatal(err)
+	}
+	if received.SourceTarPath != sourceTar {
+		t.Fatalf("source tar = %q", received.SourceTarPath)
+	}
+	wantDestinations := []string{"registry.example/team/app:test", "registry.example/team/app:latest"}
+	if strings.Join(received.Destinations, ",") != strings.Join(wantDestinations, ",") {
+		t.Fatalf("destinations = %#v, want %#v", received.Destinations, wantDestinations)
+	}
+
+	artifact, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{`"image": "registry.example/team/app:test"`, `"digest": "sha256:pushed"`} {
+		if !strings.Contains(string(artifact), expected) {
+			t.Fatalf("artifact %q does not contain %q", artifact, expected)
+		}
+	}
+	output, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output), "sha256:pushed") || strings.Contains(string(output), "IMAGE_TAR_PATH") {
+		t.Fatalf("unexpected push-only output: %s", output)
+	}
+}
+
+func TestRunGARPreservesHarnessProjectNamespace(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "harness")
+	home := filepath.Join(root, "home", "kimia")
+	for _, directory := range []string{workspace, home} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(workspace)
+
+	argumentsPath := filepath.Join(root, "arguments")
+	configPath := filepath.Join(root, "config.json")
+	fakeKimia := filepath.Join(root, "kimia")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$ARGUMENTS_PATH"
+cp "$DOCKER_CONFIG/config.json" "$CONFIG_PATH"
+for argument in "$@"; do
+  case "$argument" in
+    --digest-file=*) printf '%s\n' 'sha256:gar-build' > "${argument#*=}" ;;
+  esac
+done
+`
+	if err := os.WriteFile(fakeKimia, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	artifactPath := filepath.Join(root, "artifact.json")
+	t.Setenv("HOME", home)
+	t.Setenv("HARNESS_WORKSPACE", workspace)
+	t.Setenv("DRONE_WORKSPACE", workspace)
+	t.Setenv("ARGUMENTS_PATH", argumentsPath)
+	t.Setenv("CONFIG_PATH", configPath)
+	t.Setenv("KIMIA_EXECUTABLE", fakeKimia)
+	t.Setenv("DOCKER_CONFIG", filepath.Join(root, "docker"))
+	t.Setenv("PLUGIN_REGISTRY", "us-central1-docker.pkg.dev/example-project")
+	t.Setenv("PLUGIN_REPO", "sample-app")
+	t.Setenv("PLUGIN_TAGS", "test")
+	t.Setenv("PLUGIN_CACHE_REPO", "cache")
+	t.Setenv("PLUGIN_JSON_KEY", `{"type":"service_account","private_key":"secret"}`)
+	t.Setenv("PLUGIN_ARTIFACT_FILE", artifactPath)
+	t.Setenv("PLUGIN_SNAPSHOT_MODE", "redo")
+	t.Setenv("PLUGIN_METADATA_FILE", "/addon/tmp/buildx-metadata.json")
+	clearProxyEnvironment(t)
+
+	if err := Run(context.Background(), "gar", Streams{}); err != nil {
+		t.Fatal(err)
+	}
+	arguments, err := os.ReadFile(argumentsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"--destination=us-central1-docker.pkg.dev/example-project/sample-app:test",
+		"--import-cache=type=registry,ref=us-central1-docker.pkg.dev/example-project/cache",
+		"--export-cache=type=registry,ref=us-central1-docker.pkg.dev/example-project/cache,mode=max",
+	} {
+		if !strings.Contains(string(arguments), expected) {
+			t.Fatalf("arguments %q do not contain %q", arguments, expected)
+		}
+	}
+	assertDockerConfigUsesRegistryHost(t, configPath, "us-central1-docker.pkg.dev")
+	artifact, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`"registryUrl": "us-central1-docker.pkg.dev/example-project"`,
+		`"image": "us-central1-docker.pkg.dev/example-project/sample-app:test"`,
+		`"digest": "sha256:gar-build"`,
+	} {
+		if !strings.Contains(string(artifact), expected) {
+			t.Fatalf("artifact %q does not contain %q", artifact, expected)
+		}
+	}
+}
+
+func TestRunGARPushOnlyPreservesHarnessProjectNamespace(t *testing.T) {
+	root := t.TempDir()
+	sourceTar := filepath.Join(root, "imageci.tar")
+	if err := os.WriteFile(sourceTar, []byte("archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousPush := pushImageArchive
+	t.Cleanup(func() { pushImageArchive = previousPush })
+	var received archivepush.Options
+	configPath := filepath.Join(root, "push-config.json")
+	pushImageArchive = func(ctx context.Context, options archivepush.Options) (string, error) {
+		received = options
+		configDir := os.Getenv("DOCKER_CONFIG")
+		data, err := os.ReadFile(filepath.Join(configDir, "config.json"))
+		if err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(configPath, data, 0o600); err != nil {
+			return "", err
+		}
+		return "sha256:gar-pushed", nil
+	}
+
+	artifactPath := filepath.Join(root, "artifact.json")
+	t.Setenv("DOCKER_CONFIG", filepath.Join(root, "docker"))
+	t.Setenv("PLUGIN_REGISTRY", "us-central1-docker.pkg.dev/example-project")
+	t.Setenv("PLUGIN_REPO", "sample-app")
+	t.Setenv("PLUGIN_TAGS", "test")
+	t.Setenv("PLUGIN_PUSH_ONLY", "true")
+	t.Setenv("PLUGIN_SOURCE_TAR_PATH", sourceTar)
+	t.Setenv("PLUGIN_JSON_KEY", `{"type":"service_account","private_key":"secret"}`)
+	t.Setenv("PLUGIN_ARTIFACT_FILE", artifactPath)
+	clearProxyEnvironment(t)
+
+	if err := Run(context.Background(), "gar", Streams{}); err != nil {
+		t.Fatal(err)
+	}
+	wantDestination := "us-central1-docker.pkg.dev/example-project/sample-app:test"
+	if len(received.Destinations) != 1 || received.Destinations[0] != wantDestination {
+		t.Fatalf("push-only destinations = %#v, want %q", received.Destinations, wantDestination)
+	}
+	assertDockerConfigUsesRegistryHost(t, configPath, "us-central1-docker.pkg.dev")
+	artifact, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`"registryUrl": "us-central1-docker.pkg.dev/example-project"`,
+		`"image": "us-central1-docker.pkg.dev/example-project/sample-app:test"`,
+		`"digest": "sha256:gar-pushed"`,
+	} {
+		if !strings.Contains(string(artifact), expected) {
+			t.Fatalf("artifact %q does not contain %q", artifact, expected)
+		}
+	}
+}
+
+func assertDockerConfigUsesRegistryHost(t *testing.T, path, registryHost string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Auths map[string]json.RawMessage `json:"auths"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := document.Auths[registryHost]; !ok {
+		t.Fatalf("Docker config does not contain host-only credential %q: %s", registryHost, data)
+	}
+	for key := range document.Auths {
+		if strings.HasPrefix(key, registryHost+"/") {
+			t.Fatalf("Docker config credential includes repository namespace %q: %s", key, data)
+		}
+	}
+}
+
+func TestRunAdaptsHarnessWorkspaceAndPublishesRelativeTar(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home", "kimia")
+	workspace := filepath.Join(root, "harness")
+	for _, directory := range []string{home, workspace} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(workspace)
+
+	contextCapture := filepath.Join(root, "context")
+	fakeKimia := filepath.Join(root, "kimia")
+	script := `#!/bin/sh
+set -eu
+context=
+tar_path=
+for argument in "$@"; do
+  case "$argument" in
+    --context=*) context=${argument#*=} ;;
+    --tar-path=*) tar_path=${argument#*=} ;;
+    --digest-file=*) printf '%s\n' 'sha256:harness' > "${argument#*=}" ;;
+  esac
+done
+test -f "$context/Dockerfile"
+printf '%s\n' "$context" > "$CONTEXT_CAPTURE"
+mkdir -p "$(dirname "$tar_path")"
+printf '%s' 'harness archive' > "$tar_path"
+`
+	if err := os.WriteFile(fakeKimia, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(workspace, "drone.env")
+	t.Setenv("HOME", home)
+	t.Setenv("HARNESS_WORKSPACE", workspace)
+	t.Setenv("DRONE_WORKSPACE", workspace)
+	t.Setenv("CONTEXT_CAPTURE", contextCapture)
+	t.Setenv("KIMIA_EXECUTABLE", fakeKimia)
+	t.Setenv("DOCKER_CONFIG", filepath.Join(root, "docker"))
+	t.Setenv("PLUGIN_REPO", "example.invalid/team/app")
+	t.Setenv("PLUGIN_TAG", "test")
+	t.Setenv("PLUGIN_NO_PUSH", "true")
+	t.Setenv("PLUGIN_DESTINATION_TAR_PATH", "imageci.tar")
+	t.Setenv("PLUGIN_SNAPSHOT_MODE", "redo")
+	t.Setenv("PLUGIN_METADATA_FILE", "/addon/tmp/buildx-metadata.json")
+	t.Setenv("DRONE_OUTPUT", outputPath)
+	clearProxyEnvironment(t)
+
+	if err := Run(context.Background(), "docker", Streams{}); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := os.ReadFile(filepath.Join(workspace, "imageci.tar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(archive) != "harness archive" {
+		t.Fatalf("archive = %q", archive)
+	}
+	proxiedContext, err := os.ReadFile(contextCapture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := strings.TrimSpace(string(proxiedContext))
+	if !strings.HasPrefix(proxy, home+string(filepath.Separator)) {
+		t.Fatalf("Kimia context = %q, want private path under %q", proxy, home)
+	}
+	if _, err := os.Lstat(proxy); !os.IsNotExist(err) {
+		t.Fatalf("workspace proxy was not cleaned: %v", err)
+	}
+	output, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output), `IMAGE_TAR_PATH="imageci.tar"`) {
+		t.Fatalf("DRONE_OUTPUT did not preserve relative tar path: %s", output)
 	}
 }
 
@@ -425,7 +725,7 @@ wait "$child"
 	}
 	deadline := time.Now().Add(time.Second)
 	for {
-		if err := syscall.Kill(pid, 0); err != nil {
+		if !processIsRunning(pid) {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -433,6 +733,24 @@ wait "$child"
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func processIsRunning(pid int) bool {
+	// kill(pid, 0) reports a zombie as an existing process. In a container
+	// whose PID 1 does not reap adopted grandchildren, the descendant killed
+	// above can remain a zombie until the container exits even though it is no
+	// longer running. Use Linux's process state when available and retain the
+	// portable signal probe as a fallback for other Unix systems.
+	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err == nil {
+		if closingParen := bytes.LastIndexByte(stat, ')'); closingParen >= 0 {
+			fields := bytes.Fields(stat[closingParen+1:])
+			if len(fields) > 0 && (bytes.Equal(fields[0], []byte("Z")) || bytes.Equal(fields[0], []byte("X"))) {
+				return false
+			}
+		}
+	}
+	return syscall.Kill(pid, 0) == nil
 }
 
 func clearProxyEnvironment(t *testing.T) {

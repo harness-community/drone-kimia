@@ -142,6 +142,16 @@ func CommonFlags() []cli.Flag {
 			Usage:  "target platform",
 			EnvVar: "PLUGIN_PLATFORM,PLUGIN_CUSTOM_PLATFORM",
 		},
+		cli.StringFlag{
+			Name:   "snapshot-mode",
+			Usage:  "Kaniko compatibility input; redo is accepted as a BuildKit no-op",
+			EnvVar: "PLUGIN_SNAPSHOT_MODE",
+		},
+		cli.BoolFlag{
+			Name:   "daemon-off, daemon.off",
+			Usage:  "Docker compatibility input; true confirms Kimia's daemonless mode",
+			EnvVar: "PLUGIN_DAEMON_OFF",
+		},
 		cli.BoolFlag{
 			Name:   "enable-cache",
 			Usage:  "enable BuildKit caching",
@@ -186,9 +196,19 @@ func CommonFlags() []cli.Flag {
 			Usage:  "build without pushing an image",
 			EnvVar: "PLUGIN_NO_PUSH,PLUGIN_DRY_RUN",
 		},
+		cli.BoolFlag{
+			Name:   "push-only",
+			Usage:  "push an existing image archive without rebuilding it",
+			EnvVar: "PLUGIN_PUSH_ONLY",
+		},
+		cli.StringFlag{
+			Name:   "source-tar-path",
+			Usage:  "existing single-image Docker archive used by push-only",
+			EnvVar: "PLUGIN_SOURCE_TAR_PATH",
+		},
 		cli.StringFlag{
 			Name:   "tar-path",
-			Usage:  "export the image as a tar archive under /home/kimia",
+			Usage:  "export the image as a tar archive",
 			EnvVar: "PLUGIN_TAR_PATH,PLUGIN_DESTINATION_TAR_PATH",
 		},
 		cli.StringFlag{
@@ -205,6 +225,11 @@ func CommonFlags() []cli.Flag {
 			Name:   "artifact-file",
 			Usage:  "write the Harness docker/v1 artifact JSON",
 			EnvVar: "PLUGIN_ARTIFACT_FILE",
+		},
+		cli.StringFlag{
+			Name:   "metadata-file",
+			Usage:  "Harness compatibility input; currently ignored",
+			EnvVar: "PLUGIN_METADATA_FILE",
 		},
 		cli.StringFlag{
 			Name:   "output-file",

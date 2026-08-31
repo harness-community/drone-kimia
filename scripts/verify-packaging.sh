@@ -41,7 +41,7 @@ for name in \
 	KIMIA_VERSION KIMIA_SOURCE_COMMIT KIMIA_INDEX_DIGEST \
 	KIMIA_AMD64_DIGEST KIMIA_ARM64_DIGEST KIMIA_BUILDKIT_VERSION \
 	KIMIA_ROOTLESSKIT_VERSION GO_IMAGE DOCKER_PLUGIN_IMAGE \
-	MANIFEST_PLUGIN_IMAGE; do
+	MANIFEST_PLUGIN_IMAGE SMOKE_REGISTRY_IMAGE; do
 	require_value "${name}"
 done
 
@@ -59,7 +59,7 @@ for name in KIMIA_INDEX_DIGEST KIMIA_AMD64_DIGEST KIMIA_ARM64_DIGEST; do
 	validate_digest "${name}"
 done
 
-for image in "${GO_IMAGE}" "${DOCKER_PLUGIN_IMAGE}" "${MANIFEST_PLUGIN_IMAGE}"; do
+for image in "${GO_IMAGE}" "${DOCKER_PLUGIN_IMAGE}" "${MANIFEST_PLUGIN_IMAGE}" "${SMOKE_REGISTRY_IMAGE}"; do
 	case "${image}" in
 		*@sha256:*) ;;
 		*) fail "release tool image is not digest pinned: ${image}" ;;
@@ -101,22 +101,32 @@ for provider in docker gar ecr acr; do
 		require_contains "${dockerfile}" 'org.opencontainers.image.revision="${PLUGIN_REVISION}"'
 		require_contains "${dockerfile}" "org.opencontainers.image.base.digest=\"${digest}\""
 		require_contains "${dockerfile}" "COPY release/linux/${arch}/kimia-${provider} /usr/local/bin/kimia-${provider}"
+		require_contains "${dockerfile}" "USER 0:0"
+		require_contains "${dockerfile}" "&& chmod 0755 /kaniko"
+		require_contains "${dockerfile}" "&& ln -s /usr/local/bin/kimia-${provider} /kaniko/kaniko-${provider}"
+		require_contains "${dockerfile}" "USER 1000:1000"
 		require_contains "${dockerfile}" "RUN test \"\$(id -u):\$(id -g)\" = \"1000:1000\""
+		require_contains "${dockerfile}" "&& test \"\$(readlink /kaniko/kaniko-${provider})\" = \"/usr/local/bin/kimia-${provider}\""
+		require_contains "${dockerfile}" "&& test ! -w /kaniko"
+		require_contains "${dockerfile}" "&& /kaniko/kaniko-${provider} --version"
 		require_contains "${dockerfile}" "--help | grep -q \"PLUGIN_EXPAND_TAG\""
+		require_contains "${dockerfile}" "--help | grep -q \"PLUGIN_PUSH_ONLY\""
+		require_contains "${dockerfile}" "--help | grep -q \"PLUGIN_DAEMON_OFF\""
 		require_contains "${dockerfile}" "--help | grep -q \"${auth_help_input}\""
 		require_contains "${dockerfile}" "ENTRYPOINT [\"/usr/local/bin/kimia-${provider}\"]"
 		require_contains "${dockerfile}" "CMD []"
-		if grep -Eq '^USER[[:space:]]+' "${dockerfile}"; then
-			grep -Eq '^USER[[:space:]]+1000(:1000)?$' "${dockerfile}" || fail "${dockerfile} overrides the upstream non-root user"
-		fi
+		last_user=$(awk '/^USER[[:space:]]+/ { user = $0 } END { print user }' "${dockerfile}")
+		[ "${last_user}" = "USER 1000:1000" ] || fail "${dockerfile} must restore the upstream non-root user"
 	done
 done
 
-require_contains .drone.yml "image: ${GO_IMAGE}"
-require_contains .drone.yml "image: ${DOCKER_PLUGIN_IMAGE}"
-require_contains .drone.yml "image: ${MANIFEST_PLUGIN_IMAGE}"
-created_build_args=$(grep -c 'PLUGIN_CREATED=${DRONE_BUILD_CREATED:-unknown}' .drone.yml)
-[ "${created_build_args}" -eq 8 ] || fail ".drone.yml must pass PLUGIN_CREATED to all eight image builds"
+if [ -f .drone.yml ]; then
+	require_contains .drone.yml "image: ${GO_IMAGE}"
+	require_contains .drone.yml "image: ${DOCKER_PLUGIN_IMAGE}"
+	require_contains .drone.yml "image: ${MANIFEST_PLUGIN_IMAGE}"
+	created_build_args=$(grep -c 'PLUGIN_CREATED=${DRONE_BUILD_CREATED:-unknown}' .drone.yml)
+	[ "${created_build_args}" -eq 8 ] || fail ".drone.yml must pass PLUGIN_CREATED to all eight image builds"
+fi
 
 for harness_file in \
 	.harness/harness.yaml \

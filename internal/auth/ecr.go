@@ -53,7 +53,7 @@ func resolveECRCredential(ctx context.Context, registry string, suppliedClient E
 
 		loadOptions := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
 		if accessKey != "" {
-			provider := credentials.NewStaticCredentialsProvider(accessKey, secretKey, envutil.First("AWS_SESSION_TOKEN"))
+			provider := credentials.NewStaticCredentialsProvider(accessKey, secretKey, ecrSessionToken())
 			loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(provider))
 		}
 		configuration, err := awsconfig.LoadDefaultConfig(ctx, loadOptions...)
@@ -106,6 +106,10 @@ func resolveECRCredential(ctx context.Context, registry string, suppliedClient E
 		resolvedRegistry = tokenRegistry
 	}
 	return credential{Registry: resolvedRegistry, Username: username, Password: password}, resolvedRegistry, true, nil
+}
+
+func ecrSessionToken() string {
+	return envutil.First("PLUGIN_SESSION_TOKEN", "AWS_SESSION_TOKEN")
 }
 
 func privateECRRegistryRegion(registry string) (string, error) {

@@ -22,7 +22,12 @@ func TestApplyContextExportsDirectCLIValues(t *testing.T) {
 		"PLUGIN_CACHE_TO",
 		"PLUGIN_AUTO_TAG",
 		"PLUGIN_NO_PUSH",
+		"PLUGIN_PUSH_ONLY",
+		"PLUGIN_SOURCE_TAR_PATH",
 		"PLUGIN_PULL_IMAGE",
+		"PLUGIN_SNAPSHOT_MODE",
+		"PLUGIN_METADATA_FILE",
+		"PLUGIN_DAEMON_OFF",
 	} {
 		t.Setenv(key, "")
 	}
@@ -41,11 +46,16 @@ func TestApplyContextExportsDirectCLIValues(t *testing.T) {
 		"--multiple-build-args",
 		"--tags.auto",
 		"--dry-run",
+		"--push-only=false",
+		"--source-tar-path", "imageci.tar",
 		"--cache-from", "type=local,src=/cache/one",
 		"--cache-from", "type=registry,ref=registry.example/cache:two",
 		"--cache-to", "type=local,dest=/cache/out",
 		"--cache-to", "type=registry,ref=registry.example/cache:out,mode=max",
 		"--pull-image=false",
+		"--snapshot-mode", "redo",
+		"--metadata-file", "buildx-metadata.json",
+		"--daemon.off",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +68,12 @@ func TestApplyContextExportsDirectCLIValues(t *testing.T) {
 	assertEnvironment(t, "PLUGIN_CACHE_TO", "type=local,dest=/cache/out;type=registry,ref=registry.example/cache:out,mode=max")
 	assertEnvironment(t, "PLUGIN_AUTO_TAG", "true")
 	assertEnvironment(t, "PLUGIN_NO_PUSH", "true")
+	assertEnvironment(t, "PLUGIN_PUSH_ONLY", "false")
+	assertEnvironment(t, "PLUGIN_SOURCE_TAR_PATH", "imageci.tar")
 	assertEnvironment(t, "PLUGIN_PULL_IMAGE", "false")
+	assertEnvironment(t, "PLUGIN_SNAPSHOT_MODE", "redo")
+	assertEnvironment(t, "PLUGIN_METADATA_FILE", "buildx-metadata.json")
+	assertEnvironment(t, "PLUGIN_DAEMON_OFF", "true")
 }
 
 func TestRepeatableCacheFlagsRemainSeparateConfigSpecs(t *testing.T) {
@@ -98,9 +113,11 @@ func TestCommonFlagsExposeSupportedPluginInputs(t *testing.T) {
 		"PLUGIN_DEFAULT_SUFFIX", "DRONE_COMMIT_REF", "DRONE_REPO_BRANCH", "PLUGIN_BUILD_ARGS",
 		"PLUGIN_BUILD_ARGS_NEW", "PLUGIN_MULTIPLE_BUILD_ARGS", "PLUGIN_BUILD_ARGS_FROM_ENV",
 		"PLUGIN_TARGET", "PLUGIN_CUSTOM_LABELS", "PLUGIN_PLATFORM", "PLUGIN_CUSTOM_PLATFORM",
+		"PLUGIN_SNAPSHOT_MODE", "PLUGIN_METADATA_FILE", "PLUGIN_DAEMON_OFF",
 		"PLUGIN_ENABLE_CACHE", "PLUGIN_NO_CACHE", "PLUGIN_CACHE_REPO", "PLUGIN_CACHE_FROM",
 		"PLUGIN_CACHE_TO", "PLUGIN_IMPORT_CACHE", "PLUGIN_EXPORT_CACHE", "PLUGIN_NO_PUSH",
-		"PLUGIN_DRY_RUN", "PLUGIN_TAR_PATH", "PLUGIN_DESTINATION_TAR_PATH", "PLUGIN_DIGEST_FILE",
+		"PLUGIN_DRY_RUN", "PLUGIN_PUSH_ONLY", "PLUGIN_SOURCE_TAR_PATH", "PLUGIN_TAR_PATH",
+		"PLUGIN_DESTINATION_TAR_PATH", "PLUGIN_DIGEST_FILE",
 		"PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE", "PLUGIN_ARTIFACT_FILE", "DRONE_OUTPUT", "PLUGIN_INSECURE",
 		"PLUGIN_INSECURE_REGISTRY", "PLUGIN_VERBOSITY", "PLUGIN_LOG_TIMESTAMP", "PLUGIN_REPRODUCIBLE",
 		"PLUGIN_TIMESTAMP", "PLUGIN_GIT_BRANCH", "PLUGIN_GIT_REVISION", "PLUGIN_GIT_TOKEN_FILE",
@@ -140,8 +157,15 @@ func TestExecuteLoadsEnvFileBeforeCLIParsing(t *testing.T) {
 		t.Fatalf("Execute() code = %d, stderr = %q", code, stderr.String())
 	}
 	assertEnvironment(t, "PLUGIN_REPO", "from-file/example")
-	if !strings.Contains(stdout.String(), "--expand-tag") || !strings.Contains(stdout.String(), "PLUGIN_EXPAND_TAG") {
-		t.Fatalf("help does not expose the common plugin contract:\n%s", stdout.String())
+	for _, input := range []string{
+		"--expand-tag", "PLUGIN_EXPAND_TAG",
+		"--snapshot-mode", "PLUGIN_SNAPSHOT_MODE",
+		"--metadata-file", "PLUGIN_METADATA_FILE",
+		"--daemon-off", "PLUGIN_DAEMON_OFF",
+	} {
+		if !strings.Contains(stdout.String(), input) {
+			t.Fatalf("help does not expose %s in the common plugin contract:\n%s", input, stdout.String())
+		}
 	}
 }
 

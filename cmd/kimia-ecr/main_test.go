@@ -19,6 +19,7 @@ func TestProviderFlagsExposeECRAuthentication(t *testing.T) {
 		"PLUGIN_SECRET_KEY",
 		"ECR_SECRET_KEY",
 		"AWS_SECRET_ACCESS_KEY",
+		"PLUGIN_SESSION_TOKEN",
 		"AWS_SESSION_TOKEN",
 		"PLUGIN_ASSUME_ROLE",
 		"PLUGIN_EXTERNAL_ID",

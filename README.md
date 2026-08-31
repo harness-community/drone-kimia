@@ -11,7 +11,8 @@ The initial scope is intentionally small:
 - BuildKit only
 - Docker-compatible registries, GAR, ECR, and ACR
 - Linux amd64 and arm64
-- direct input-to-Kimia mappings, plus tag and authentication preparation
+- direct input-to-Kimia mappings, plus narrowly scoped Harness workspace and
+  build-to-tar/push-only compatibility
 - no GCR image, Buildah backend, Docker daemon, or implicit engine fallback
 
 BuildKit is the only backend because it is the closest fit for Kaniko's
@@ -21,12 +22,12 @@ a second backend-specific compatibility layer.
 
 ## Images
 
-| Registry flow | Command | Release image |
-| --- | --- | --- |
-| Docker-compatible registry | `kimia-docker` | `plugins/kimia` |
-| Google Artifact Registry | `kimia-gar` | `plugins/kimia-gar` |
-| Amazon Elastic Container Registry | `kimia-ecr` | `plugins/kimia-ecr` |
-| Azure Container Registry | `kimia-acr` | `plugins/kimia-acr` |
+| Registry flow | Command | Harness compatibility entrypoint | Release image |
+| --- | --- | --- | --- |
+| Docker-compatible registry | `kimia-docker` | `/kaniko/kaniko-docker` | `plugins/kimia` |
+| Google Artifact Registry | `kimia-gar` | `/kaniko/kaniko-gar` | `plugins/kimia-gar` |
+| Amazon Elastic Container Registry | `kimia-ecr` | `/kaniko/kaniko-ecr` | `plugins/kimia-ecr` |
+| Azure Container Registry | `kimia-acr` | `/kaniko/kaniko-acr` | `plugins/kimia-acr` |
 
 Every image derives directly from the architecture-specific manifest of Kimia
 v1.0.26. The version and digests are recorded in [`versions.env`](versions.env);
@@ -93,13 +94,17 @@ or can be resolved before Kimia is invoked.
 | `PLUGIN_ENABLE_CACHE`, `PLUGIN_NO_CACHE`, `PLUGIN_CACHE_REPO` | enables/disables cache; a cache repository becomes registry import and `mode=max` export specifications |
 | `PLUGIN_CACHE_FROM`, `PLUGIN_CACHE_TO` | raw image references become BuildKit registry cache specifications; values beginning with `type=` pass through |
 | `PLUGIN_NO_PUSH` or `PLUGIN_DRY_RUN` | `--no-push` |
-| `PLUGIN_TAR_PATH` or `PLUGIN_DESTINATION_TAR_PATH` | `--tar-path` |
+| `PLUGIN_TAR_PATH` or `PLUGIN_DESTINATION_TAR_PATH` | exports a Docker archive; relative Harness workspace paths are staged for Kimia and copied back after success |
+| `PLUGIN_PUSH_ONLY`, `PLUGIN_SOURCE_TAR_PATH` | loads a single-image Docker archive and pushes it to the resolved destinations without rebuilding |
 | `PLUGIN_DIGEST_FILE`, `PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE` | corresponding Kimia digest outputs |
 | `PLUGIN_INSECURE`, `PLUGIN_INSECURE_REGISTRY` | corresponding Kimia registry options |
 | `PLUGIN_VERBOSITY`, `PLUGIN_LOG_TIMESTAMP` | corresponding Kimia logging options |
 | `PLUGIN_REPRODUCIBLE` | `--reproducible` |
 | `PLUGIN_GIT_BRANCH`, `PLUGIN_GIT_REVISION`, token inputs | corresponding Kimia Git context options |
 | `PLUGIN_ARTIFACT_FILE`, `DRONE_OUTPUT` | wrapper output destinations after a successful build |
+| `PLUGIN_SNAPSHOT_MODE=redo` | accepted as a no-op because Harness injects this Kaniko optimization hint; BuildKit performs its own snapshotting |
+| `PLUGIN_DAEMON_OFF=true` | accepted as a no-op because Harness injects it for VM steps and Kimia never starts a Docker daemon; `false` is rejected |
+| `PLUGIN_METADATA_FILE` | accepted and ignored because Harness injects it for GAR |
 | `PLUGIN_ENV_FILE` | loaded before other plugin inputs are evaluated |
 
 `PLUGIN_PULL_IMAGE=true` is accepted as the existing default behavior.
@@ -108,7 +113,9 @@ or can be resolved before Kimia is invoked.
 Engine-specific Kaniko, Docker daemon, and Buildx options are not passed
 through. A configured unsupported input fails before authentication or the
 build begins. Boolean inputs explicitly set to `false` do not fail when false
-means that the unsupported feature was not requested. The source of truth is
+means that the unsupported feature was not requested; an inverse request such
+as `PLUGIN_DAEMON_OFF=false` is rejected because it asks Kimia to start a
+Docker daemon. The source of truth is
 [`internal/config/unsupported.go`](internal/config/unsupported.go).
 
 Notable inputs rejected for the BuildKit backend include `PLUGIN_CACHE_DIR`,
@@ -158,7 +165,7 @@ type: Plugin
 spec:
   image: plugins/kimia
   settings:
-    context: /home/kimia/workspace
+    context: .
     dockerfile: Dockerfile
     repo: registry.example.com/team/app
     tags: verify
@@ -169,7 +176,7 @@ The wrapper invokes the equivalent of:
 
 ```text
 /usr/local/bin/kimia \
-  --context /home/kimia/workspace \
+  --context /home/kimia/<private-workspace-proxy> \
   --dockerfile Dockerfile \
   --destination registry.example.com/team/app:verify \
   --no-push
@@ -178,38 +185,66 @@ The wrapper invokes the equivalent of:
 This validates and executes the build, but it does not load the result into a
 Docker daemon. Use tar export when the built image must be retained locally.
 
-## Tar export
+## Tar export and push-only
 
-Kimia v1.0.26 requires the tar path to be under `/home/kimia`. A destination is
-still required by Kimia's CLI, but the v1.0.26 BuildKit Docker exporter does
-not record that destination as a `RepoTag` in the resulting archive:
+Kimia v1.0.26 internally requires its local context and tar destination to be
+under `/home/kimia`. The wrapper absorbs that implementation detail. When a
+Harness step starts in `/harness`, the normal context `.` is exposed to Kimia
+through a private path under its home. A relative tar output such as
+`imageci.tar` is written privately and atomically copied back to
+`/harness/imageci.tar` before the step succeeds:
 
 ```yaml
 type: Plugin
 spec:
   image: plugins/kimia
   settings:
-    context: /home/kimia/workspace
+    context: .
     dockerfile: Dockerfile
     repo: registry.example.com/team/app
     tags: verify
-    tar_path: /home/kimia/output/app.tar
+    no_push: true
+    tar_path: imageci.tar
 ```
 
 Equivalent Kimia arguments:
 
 ```text
 /usr/local/bin/kimia \
-  --context /home/kimia/workspace \
+  --context /home/kimia/<private-workspace-proxy> \
   --dockerfile Dockerfile \
   --destination registry.example.com/team/app:verify \
-  --tar-path /home/kimia/output/app.tar
+  --tar-path /home/kimia/<private-output>/image.tar
 ```
 
 For the BuildKit backend, `--tar-path` selects Docker archive output instead of
-registry push; `no_push` is not required. The context and output directories
-must be mounted under `/home/kimia`, and the output directory must be writable
-by UID/GID 1000.
+registry push; `no_push` is optional when a tar path is present. Harness already
+mounts `/harness` as the shared workspace for every step, so this workflow does
+not require another shared path or a `/home/kimia` path in the pipeline. The
+workspace must remain writable by the plugin's non-root UID 1000.
+
+The v1.0.26 archive contains one image but leaves Docker `RepoTags` empty. The
+wrapper does not rely on that field. In a later step, it loads the single image
+and applies the repository and tags supplied by the current plugin step:
+
+```yaml
+type: Plugin
+spec:
+  image: plugins/kimia
+  settings:
+    repo: registry.example.com/team/app
+    tags: verify
+    push_only: true
+    source_tar_path: imageci.tar
+```
+
+Push-only is implemented with the same `go-containerregistry` archive and
+registry flow used by `drone-kaniko`. It reuses the selected Docker, GAR, ECR,
+or ACR authentication, pushes directly over the registry API, and writes the
+normal digest, Harness artifact, and `DRONE_OUTPUT` results. It does not start
+Kimia, BuildKit, Buildah, or a Docker daemon and does not require privileged
+mode. The source must be a regular, single-image Docker archive; zero-image or
+multi-image archives fail before any push.
 
 ## Registry authentication
 
@@ -271,6 +306,11 @@ from `PLUGIN_JSON_KEY`, `GCR_JSON_KEY`, `GOOGLE_CREDENTIALS`, or `TOKEN`;
 plain JSON and base64-encoded JSON are accepted. `PLUGIN_WORKLOAD_IDENTITY=true`
 exchanges that credential for an OAuth access token.
 
+Harness GAR steps provide `PLUGIN_REGISTRY` as `<host>/<project>`. The project
+namespace is retained when constructing image and cache destinations, while
+only the registry host is used as the Docker authentication key. A fully
+qualified repository on the same GAR host is not prefixed a second time.
+
 The existing environment-supplied OIDC flow is also accepted when all of these
 are present: `PLUGIN_OIDC_TOKEN_ID`, `PLUGIN_PROJECT_NUMBER`, `PLUGIN_POOL_ID`,
 `PLUGIN_PROVIDER_ID`, and `PLUGIN_SERVICE_ACCOUNT_EMAIL`. Partial OIDC input is
@@ -298,7 +338,7 @@ authorization token and stores the returned Docker credential for Kimia.
 | Region | `PLUGIN_REGION`, `ECR_REGION`, `AWS_REGION` (default `us-east-1`) |
 | Access key | `PLUGIN_ACCESS_KEY`, `ECR_ACCESS_KEY`, `AWS_ACCESS_KEY_ID` |
 | Secret key | `PLUGIN_SECRET_KEY`, `ECR_SECRET_KEY`, `AWS_SECRET_ACCESS_KEY` |
-| Session token | `AWS_SESSION_TOKEN` |
+| Session token | `PLUGIN_SESSION_TOKEN`, `AWS_SESSION_TOKEN` |
 | Role | `PLUGIN_ASSUME_ROLE` |
 | External ID | `PLUGIN_EXTERNAL_ID` |
 | Web identity token | `PLUGIN_OIDC_TOKEN_ID`, used only with `PLUGIN_ASSUME_ROLE` |
@@ -394,7 +434,7 @@ type: Plugin
 spec:
   image: plugins/kimia
   settings:
-    context: /home/kimia/workspace
+    context: .
     dockerfile: Dockerfile
     repo: registry.example.com/team/app
     tags: ${<+codebase.shortCommitSha>}
@@ -407,6 +447,26 @@ the plugin performs no Harness API or connector calls. If a complete
 `PLUGIN_DESTINATIONS` value supplies the host, `PLUGIN_REGISTRY` may be omitted
 and the wrapper authenticates that inferred host. If both are present, their
 hosts must match.
+
+Harness supplies explicit Kaniko entrypoints for its built-in build-and-push
+steps even when the backend image is overridden. Each Kimia provider image
+therefore exposes the matching `/kaniko/kaniko-*` compatibility path as a
+root-owned, read-only alias to the provider's Kimia wrapper. It does not invoke
+Kaniko or change the image's final non-root runtime contract.
+
+For built-in Harness build-and-push steps, no `optimize`, context, tar-path, or
+shared-path workaround is required. Harness's injected
+`PLUGIN_SNAPSHOT_MODE=redo` is accepted as a BuildKit no-op, and its GAR
+`PLUGIN_METADATA_FILE` input is ignored. The adapter transparently exposes the
+existing `/harness` context to Kimia and returns relative tar outputs to that
+same shared workspace. Other nonempty engine-specific inputs remain explicit
+errors when they have no truthful BuildKit equivalent.
+
+VM steps may inject `PLUGIN_DAEMON_OFF=true`; Kimia accepts it because its
+BuildKit flow is already daemonless. Harness's separate DLC/Buildx execution
+mode replaces the executable with `dockerd-entrypoint.sh` and a Buildx binary,
+not merely the image. That fixed Docker-daemon entrypoint is outside the thin
+Kimia compatibility path and must not be overridden with these images.
 
 ## Runtime contract
 

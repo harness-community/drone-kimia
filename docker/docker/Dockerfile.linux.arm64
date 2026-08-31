@@ -21,11 +21,22 @@ LABEL org.opencontainers.image.title="drone-kimia" \
 
 COPY release/linux/arm64/kimia-docker /usr/local/bin/kimia-docker
 
+USER 0:0
+RUN mkdir -p /kaniko \
+    && chmod 0755 /kaniko \
+    && ln -s /usr/local/bin/kimia-docker /kaniko/kaniko-docker
+USER 1000:1000
+
 RUN test "$(id -u):$(id -g)" = "1000:1000" \
     && test "${HOME}" = "/home/kimia" \
     && test "$(pwd)" = "/home/kimia" \
+    && test "$(readlink /kaniko/kaniko-docker)" = "/usr/local/bin/kimia-docker" \
+    && test ! -w /kaniko \
     && /usr/local/bin/kimia-docker --version \
+    && /kaniko/kaniko-docker --version \
     && /usr/local/bin/kimia-docker --help | grep -q "PLUGIN_EXPAND_TAG" \
+    && /usr/local/bin/kimia-docker --help | grep -q "PLUGIN_PUSH_ONLY" \
+    && /usr/local/bin/kimia-docker --help | grep -q "PLUGIN_DAEMON_OFF" \
     && /usr/local/bin/kimia-docker --help | grep -q "PLUGIN_USERNAME" \
     && buildkitd --version \
     && rootlesskit --version

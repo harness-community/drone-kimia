@@ -347,6 +347,20 @@ func TestPrepareECRUsesAuthorizationToken(t *testing.T) {
 	assertTestAuth(t, document.Auths, result.Registry, "AWS", "ecr-password")
 }
 
+func TestECRSessionTokenUsesHarnessPluginAliasFirst(t *testing.T) {
+	clearAuthEnvironment(t)
+	t.Setenv("AWS_SESSION_TOKEN", "aws-fallback")
+	t.Setenv("PLUGIN_SESSION_TOKEN", "harness-token")
+	if got := ecrSessionToken(); got != "harness-token" {
+		t.Fatalf("ecrSessionToken() = %q, want Harness plugin token", got)
+	}
+
+	t.Setenv("PLUGIN_SESSION_TOKEN", "")
+	if got := ecrSessionToken(); got != "aws-fallback" {
+		t.Fatalf("ecrSessionToken() fallback = %q, want AWS session token", got)
+	}
+}
+
 func TestPrivateECRRegistryRegion(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -525,6 +539,7 @@ func clearAuthEnvironment(t *testing.T) {
 		"PLUGIN_CONFIG", "PLUGIN_DOCKER_PASSWORD", "PLUGIN_DOCKER_REGISTRY", "PLUGIN_DOCKER_USERNAME",
 		"PLUGIN_EXTERNAL_ID", "PLUGIN_JSON_KEY", "PLUGIN_LOCATION", "PLUGIN_OIDC_TOKEN_ID", "PLUGIN_PASSWORD",
 		"PLUGIN_POOL_ID", "PLUGIN_PROJECT_NUMBER", "PLUGIN_PROVIDER_ID", "PLUGIN_REGION", "PLUGIN_REGISTRY",
+		"PLUGIN_SESSION_TOKEN",
 		"PLUGIN_SERVICE_ACCOUNT_EMAIL", "PLUGIN_TENANT_ID", "PLUGIN_USERNAME", "PLUGIN_WORKLOAD_IDENTITY",
 		"SERVICE_PRINCIPAL_CLIENT_ID", "SERVICE_PRINCIPAL_CLIENT_SECRET", "TENANT_ID", "TOKEN",
 	}

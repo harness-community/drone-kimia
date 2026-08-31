@@ -21,11 +21,22 @@ LABEL org.opencontainers.image.title="drone-kimia-ecr" \
 
 COPY release/linux/amd64/kimia-ecr /usr/local/bin/kimia-ecr
 
+USER 0:0
+RUN mkdir -p /kaniko \
+    && chmod 0755 /kaniko \
+    && ln -s /usr/local/bin/kimia-ecr /kaniko/kaniko-ecr
+USER 1000:1000
+
 RUN test "$(id -u):$(id -g)" = "1000:1000" \
     && test "${HOME}" = "/home/kimia" \
     && test "$(pwd)" = "/home/kimia" \
+    && test "$(readlink /kaniko/kaniko-ecr)" = "/usr/local/bin/kimia-ecr" \
+    && test ! -w /kaniko \
     && /usr/local/bin/kimia-ecr --version \
+    && /kaniko/kaniko-ecr --version \
     && /usr/local/bin/kimia-ecr --help | grep -q "PLUGIN_EXPAND_TAG" \
+    && /usr/local/bin/kimia-ecr --help | grep -q "PLUGIN_PUSH_ONLY" \
+    && /usr/local/bin/kimia-ecr --help | grep -q "PLUGIN_DAEMON_OFF" \
     && /usr/local/bin/kimia-ecr --help | grep -q "PLUGIN_ACCESS_KEY" \
     && buildkitd --version \
     && rootlesskit --version

@@ -70,6 +70,29 @@ case "${version_output}" in
 	*) echo "${image}: unexpected --version output: ${version_output}" >&2; exit 1 ;;
 esac
 
+compat_version_output=$("${container_cli}" run --rm \
+	--entrypoint "/kaniko/kaniko-${provider}" \
+	"${image}" \
+	--version)
+case "${compat_version_output}" in
+	*"provider=${provider}; kimia=${KIMIA_VERSION}"*) ;;
+	*) echo "${image}: unexpected Harness compatibility entrypoint output: ${compat_version_output}" >&2; exit 1 ;;
+esac
+
+compat_target=$("${container_cli}" run --rm \
+	--entrypoint /bin/sh \
+	"${image}" \
+	-c "readlink /kaniko/kaniko-${provider}")
+assert_equal Harness-entrypoint-target "/usr/local/bin/kimia-${provider}" "${compat_target}"
+
+if ! "${container_cli}" run --rm \
+	--entrypoint /bin/sh \
+	"${image}" \
+	-c 'test ! -w /kaniko'; then
+	echo "${image}: /kaniko must not be writable by the runtime user" >&2
+	exit 1
+fi
+
 buildkit_output=$("${container_cli}" run --rm --entrypoint buildkitd "${image}" --version)
 case "${buildkit_output}" in
 	*"v${KIMIA_BUILDKIT_VERSION}"*) ;;
@@ -82,4 +105,4 @@ case "${rootlesskit_output}" in
 	*) echo "${image}: unexpected RootlessKit version: ${rootlesskit_output}" >&2; exit 1 ;;
 esac
 
-echo "${image}: image contract verified"
+echo "${image}: image and Harness compatibility entrypoint contracts verified"

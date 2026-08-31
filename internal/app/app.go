@@ -11,15 +11,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/harness-community/drone-kimia/internal/archivepush"
 	"github.com/harness-community/drone-kimia/internal/auth"
 	"github.com/harness-community/drone-kimia/internal/config"
 	"github.com/harness-community/drone-kimia/internal/destination"
 	"github.com/harness-community/drone-kimia/internal/envutil"
 	"github.com/harness-community/drone-kimia/internal/kimia"
 	"github.com/harness-community/drone-kimia/internal/result"
+	"github.com/harness-community/drone-kimia/internal/workspacecompat"
 )
 
 const childShutdownTimeout = 10 * time.Second
+
+var pushImageArchive = archivepush.Push
 
 type Streams struct {
 	Stdin  io.Reader
@@ -48,14 +52,15 @@ func Run(ctx context.Context, provider string, streams Streams) error {
 	if err != nil {
 		return fmt.Errorf("validate destination registry: %w", err)
 	}
-	willPush := !cfg.NoPush && cfg.TarPath == ""
+	destinationRegistry := cfg.Registry
+	willPush := cfg.PushOnly || (!cfg.NoPush && cfg.TarPath == "")
 	cacheRegistries := destination.CacheRegistries(cfg.CacheRepo, cfg.ImportCache, cfg.ExportCache)
-	authRegistry := cfg.Registry
+	authRegistry := destination.NormalizeRegistry(destinationRegistry)
 	if authRegistry == "" {
 		authRegistry = providerCacheRegistry(auth.Provider(provider), cacheRegistries)
 	}
 	cacheUsesAuthRegistry := cacheTargetsRegistry(cfg, authRegistry, cacheRegistries)
-	cacheAuthOnly := !willPush && cfg.Registry == "" && (cfg.CacheRepo != "" || hasRegistryCache(cfg.ImportCache) || hasRegistryCache(cfg.ExportCache))
+	cacheAuthOnly := !willPush && destinationRegistry == "" && (cfg.CacheRepo != "" || hasRegistryCache(cfg.ImportCache) || hasRegistryCache(cfg.ExportCache))
 
 	sourceConfigDir := strings.TrimSpace(os.Getenv("DOCKER_CONFIG"))
 	privateConfigDir, err := os.MkdirTemp("", "drone-kimia-docker-config-*")
@@ -76,17 +81,25 @@ func Run(ctx context.Context, provider string, streams Streams) error {
 	if err != nil {
 		return fmt.Errorf("prepare registry authentication: %w", err)
 	}
-	if authResult.Registry != "" && !cacheAuthOnly {
-		cfg.Registry = authResult.Registry
+	if authResult.Registry != "" {
+		resolvedAuthRegistry := destination.NormalizeRegistry(authResult.Registry)
+		if authRegistry != "" && resolvedAuthRegistry != authRegistry {
+			return fmt.Errorf("registry authentication resolved host %q, expected %q", resolvedAuthRegistry, authRegistry)
+		}
+		authRegistry = resolvedAuthRegistry
+		if destinationRegistry == "" && !cacheAuthOnly {
+			destinationRegistry = authResult.Registry
+			cfg.Registry = destinationRegistry
+		}
 	}
-	cacheRegistry := cfg.Registry
-	if cacheAuthOnly && authResult.Registry != "" {
-		cacheRegistry = authResult.Registry
+	cacheRegistry := destinationRegistry
+	if cacheAuthOnly && authRegistry != "" {
+		cacheRegistry = authRegistry
 	}
 
-	forceRegistryPrefix := provider != string(auth.ProviderDocker) && cfg.Registry != ""
+	forceRegistryPrefix := provider != string(auth.ProviderDocker) && destinationRegistry != ""
 	resolved, err := destination.Resolve(destination.Input{
-		Registry:            cfg.Registry,
+		Registry:            destinationRegistry,
 		Repository:          cfg.Repo,
 		Tags:                cfg.Tags,
 		Direct:              cfg.Destinations,
@@ -95,6 +108,31 @@ func Run(ctx context.Context, provider string, streams Streams) error {
 	})
 	if err != nil {
 		return fmt.Errorf("resolve image destinations: %w", err)
+	}
+	if cfg.PushOnly {
+		cleanup, err := ensureDigestOutput(&cfg)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+
+		digest, err := pushImageArchive(ctx, archivepush.Options{
+			SourceTarPath:      cfg.SourceTarPath,
+			Destinations:       resolved.Destinations,
+			Insecure:           cfg.Insecure,
+			InsecureRegistries: cfg.InsecureRegistries,
+			Writer:             streams.Stdout,
+		})
+		if err != nil {
+			return fmt.Errorf("push existing image archive: %w", err)
+		}
+		if cfg.DigestFile != "" {
+			if err := result.WriteDigest(cfg.DigestFile, digest); err != nil {
+				return fmt.Errorf("write pushed image digest: %w", err)
+			}
+		}
+		writeRequestedResults(cfg, resolved, destinationRegistry, streams.Stderr)
+		return nil
 	}
 	if cfg.CacheRepo != "" {
 		cfg.CacheRepo, err = destination.QualifyRepository(
@@ -113,6 +151,23 @@ func Run(ctx context.Context, provider string, streams Streams) error {
 	}
 	defer cleanup()
 
+	workspacePlan, err := workspacecompat.Prepare(workspacecompat.Input{
+		Context:    cfg.Context,
+		Dockerfile: cfg.Dockerfile,
+		TarPath:    cfg.TarPath,
+	})
+	if err != nil {
+		return fmt.Errorf("prepare Kimia workspace compatibility: %w", err)
+	}
+	defer func() {
+		if err := workspacePlan.Cleanup(); err != nil {
+			warn(streams.Stderr, "could not clean workspace compatibility paths: %v", err)
+		}
+	}()
+	cfg.Context = workspacePlan.Context
+	cfg.Dockerfile = workspacePlan.Dockerfile
+	cfg.TarPath = workspacePlan.TarPath
+
 	command, err := kimia.Render(cfg, resolved.Destinations)
 	if err != nil {
 		return fmt.Errorf("render Kimia command: %w", err)
@@ -122,10 +177,17 @@ func Run(ctx context.Context, provider string, streams Streams) error {
 		cosignPasswordEnv = cfg.CosignPasswordEnv
 	}
 	if err := execute(ctx, command, streams, cosignPasswordEnv); err != nil {
+		if cleanupErr := workspacePlan.Finalize(false); cleanupErr != nil {
+			warn(streams.Stderr, "could not clean failed workspace adaptation: %v", cleanupErr)
+		}
 		return err
 	}
+	if err := workspacePlan.Finalize(true); err != nil {
+		return fmt.Errorf("publish Kimia workspace outputs: %w", err)
+	}
+	cfg.TarPath = workspacePlan.OriginalTarPath
 
-	writeRequestedResults(cfg, resolved, cfg.Registry, streams.Stderr)
+	writeRequestedResults(cfg, resolved, destinationRegistry, streams.Stderr)
 	return nil
 }
 
@@ -152,6 +214,9 @@ func ExitCode(err error) int {
 }
 
 func requiresRegistryAuthentication(cfg config.Config, registry string, cacheUsesRegistry bool) bool {
+	if cfg.PushOnly {
+		return true
+	}
 	if !cfg.NoPush && cfg.TarPath == "" {
 		return true
 	}

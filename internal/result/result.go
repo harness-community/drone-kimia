@@ -40,6 +40,16 @@ func ReadDigest(path string) (string, error) {
 	return digest, nil
 }
 
+// WriteDigest records a registry manifest digest for operations, such as
+// push-only, that do not ask Kimia to create its normal digest output file.
+func WriteDigest(path, digest string) error {
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return fmt.Errorf("image digest is empty")
+	}
+	return writeFile(path, []byte(digest+"\n"), 0o644)
+}
+
 func WriteArtifact(path, registryType, registryURL, digest string, destinations []string) error {
 	images := make([]Image, 0, len(destinations))
 	for _, destination := range destinations {

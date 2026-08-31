@@ -40,7 +40,7 @@ func providerFlags() []cli.Flag {
 		cli.StringFlag{
 			Name:   "session-token",
 			Usage:  "AWS session token for temporary credentials",
-			EnvVar: "AWS_SESSION_TOKEN",
+			EnvVar: "PLUGIN_SESSION_TOKEN,AWS_SESSION_TOKEN",
 		},
 		cli.StringFlag{
 			Name:   "assume-role",

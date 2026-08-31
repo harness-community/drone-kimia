@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/harness-community/drone-kimia/internal/envutil"
@@ -36,7 +35,9 @@ type Config struct {
 	ExportCache  []string
 
 	NoPush                  bool
+	PushOnly                bool
 	TarPath                 string
+	SourceTarPath           string
 	DigestFile              string
 	ImageNameWithDigestFile string
 	ArtifactFile            string
@@ -86,6 +87,7 @@ func Load(provider string) (Config, error) {
 	cfg.CacheDir = envutil.First("PLUGIN_CACHE_DIR")
 	cfg.CacheRepo = envutil.First("PLUGIN_CACHE_REPO")
 	cfg.TarPath = envutil.First("PLUGIN_TAR_PATH", "PLUGIN_DESTINATION_TAR_PATH")
+	cfg.SourceTarPath = envutil.First("PLUGIN_SOURCE_TAR_PATH")
 	cfg.DigestFile = envutil.First("PLUGIN_DIGEST_FILE")
 	cfg.ImageNameWithDigestFile = envutil.First("PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE")
 	cfg.ArtifactFile = envutil.First("PLUGIN_ARTIFACT_FILE")
@@ -106,6 +108,7 @@ func Load(provider string) (Config, error) {
 		&cfg.EnableCache:  {"PLUGIN_ENABLE_CACHE"},
 		&cfg.DisableCache: {"PLUGIN_NO_CACHE"},
 		&cfg.NoPush:       {"PLUGIN_NO_PUSH", "PLUGIN_DRY_RUN"},
+		&cfg.PushOnly:     {"PLUGIN_PUSH_ONLY"},
 		&cfg.Insecure:     {"PLUGIN_INSECURE"},
 		&cfg.InsecurePull: {"PLUGIN_INSECURE_PULL"},
 		&cfg.LogTimestamp: {"PLUGIN_LOG_TIMESTAMP"},
@@ -188,6 +191,15 @@ func (cfg Config) Validate() error {
 	if cfg.EnableCache && cfg.DisableCache {
 		return fmt.Errorf("PLUGIN_ENABLE_CACHE conflicts with PLUGIN_NO_CACHE")
 	}
+	if cfg.PushOnly && cfg.NoPush {
+		return fmt.Errorf("PLUGIN_PUSH_ONLY conflicts with PLUGIN_NO_PUSH")
+	}
+	if cfg.PushOnly && cfg.TarPath != "" {
+		return fmt.Errorf("PLUGIN_PUSH_ONLY conflicts with PLUGIN_TAR_PATH")
+	}
+	if cfg.PushOnly && strings.TrimSpace(cfg.SourceTarPath) == "" {
+		return fmt.Errorf("PLUGIN_SOURCE_TAR_PATH is required when PLUGIN_PUSH_ONLY=true")
+	}
 	if cfg.Attestation != "" && len(cfg.Attest) > 0 {
 		return fmt.Errorf("PLUGIN_ATTESTATION conflicts with PLUGIN_ATTEST")
 	}
@@ -200,11 +212,11 @@ func (cfg Config) Validate() error {
 	if cfg.Sign && (cfg.NoPush || cfg.TarPath != "") {
 		return fmt.Errorf("PLUGIN_SIGN requires a registry push; it cannot be combined with build-only or tar export")
 	}
+	if cfg.Sign && cfg.PushOnly {
+		return fmt.Errorf("PLUGIN_SIGN is not supported with PLUGIN_PUSH_ONLY")
+	}
 	if cfg.Sign && strings.EqualFold(strings.TrimSpace(cfg.Attestation), "off") {
 		return fmt.Errorf("PLUGIN_SIGN cannot be combined with PLUGIN_ATTESTATION=off")
-	}
-	if cfg.TarPath != "" && !isWithinKimiaHome(cfg.TarPath) {
-		return fmt.Errorf("PLUGIN_TAR_PATH must be under /home/kimia for Kimia v1.0.26")
 	}
 	if err := ValidateUnsupportedEnvironment(); err != nil {
 		return err
@@ -291,10 +303,4 @@ func firstWithDefault(fallback string, keys ...string) string {
 		return value
 	}
 	return fallback
-}
-
-func isWithinKimiaHome(path string) bool {
-	clean := filepath.Clean(path)
-	relative, err := filepath.Rel("/home/kimia", clean)
-	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }

@@ -127,8 +127,12 @@ func registryCacheReference(specification string) (string, bool) {
 }
 
 // ReconcileRegistry uses an inferred destination host when PLUGIN_REGISTRY is
-// absent and rejects mismatches when both are present.
+// absent and rejects host mismatches when both are present. The configured
+// value may include a repository namespace (for example GAR's host/project),
+// which is preserved for destination construction while only the host is used
+// for reconciliation and authentication.
 func ReconcileRegistry(configured, inferred string) (string, error) {
+	configuredPrefix := RegistryPrefix(configured)
 	configuredHost := NormalizeRegistry(configured)
 	inferredHost := NormalizeRegistry(inferred)
 	if configuredHost == "" {
@@ -137,7 +141,7 @@ func ReconcileRegistry(configured, inferred string) (string, error) {
 	if inferredHost != "" && !sameRegistry(configuredHost, inferredHost) {
 		return "", fmt.Errorf("configured registry %q does not match destination registry %q", configuredHost, inferredHost)
 	}
-	return configuredHost, nil
+	return configuredPrefix, nil
 }
 
 // RegistryHost extracts an explicit registry host from an image repository.
@@ -156,25 +160,48 @@ func RegistryHost(repository string) string {
 	return ""
 }
 
-// NormalizeRegistry converts registry URLs and aliases to the host form used
-// in image references. Docker Hub remains implicit.
-func NormalizeRegistry(registry string) string {
+// RegistryPrefix converts a configured registry URL or value to the image
+// prefix used for destination and cache repositories. Unlike
+// NormalizeRegistry, it preserves a namespace following the host. Harness GAR
+// steps use this form to supply "host/project" in PLUGIN_REGISTRY.
+func RegistryPrefix(registry string) string {
 	registry = strings.TrimSpace(registry)
 	if registry == "" {
 		return ""
 	}
+
+	host := ""
+	path := ""
 	if parsed, err := url.Parse(registry); err == nil && parsed.Scheme != "" && parsed.Host != "" {
-		registry = parsed.Host
+		host = parsed.Host
+		path = parsed.Path
 	} else {
 		registry = strings.TrimSuffix(registry, "/")
-		registry = strings.TrimSuffix(registry, "/v1")
-		registry = strings.TrimSuffix(registry, "/v2")
-		registry = strings.TrimSuffix(registry, "/")
+		host, path, _ = strings.Cut(registry, "/")
 	}
-	if isDockerHub(registry) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	path = strings.Trim(strings.TrimSpace(path), "/")
+	if path == "v1" || path == "v2" {
+		path = ""
+	}
+	if isDockerHub(host) {
 		return "docker.io"
 	}
-	return strings.ToLower(registry)
+	if host == "" || path == "" {
+		return host
+	}
+	return host + "/" + strings.ToLower(path)
+}
+
+// NormalizeRegistry converts registry URLs, namespace prefixes, and aliases
+// to the host-only form used for authentication. Docker Hub remains implicit.
+func NormalizeRegistry(registry string) string {
+	prefix := RegistryPrefix(registry)
+	host, _, _ := strings.Cut(prefix, "/")
+	if isDockerHub(host) {
+		return "docker.io"
+	}
+	return host
 }
 
 func sameRegistry(left, right string) bool {
@@ -196,7 +223,7 @@ func Resolve(input Input) (Result, error) {
 	}
 
 	if input.ExpandRepository || input.ForceRegistryPrefix {
-		registry := normalizeRegistry(input.Registry)
+		registry := normalizeRegistryPrefix(input.Registry)
 		if input.ForceRegistryPrefix && registry == "" {
 			return Result{}, fmt.Errorf("registry is required when registry prefixing is forced")
 		}
@@ -246,8 +273,15 @@ func QualifyRepository(registry, repository string, prefix bool) (string, error)
 		return repository, nil
 	}
 
-	registry = normalizeRegistry(registry)
-	if registry == "" || isDockerHub(registry) {
+	registry = normalizeRegistryPrefix(registry)
+	if registry == "" {
+		return repository, nil
+	}
+	if repositoryRegistry := RegistryHost(repository); repositoryRegistry != "" {
+		configuredHost := NormalizeRegistry(registry)
+		if !sameRegistry(configuredHost, repositoryRegistry) {
+			return "", fmt.Errorf("configured registry %q does not match repository registry %q", configuredHost, repositoryRegistry)
+		}
 		return repository, nil
 	}
 	if strings.HasPrefix(repository, registry+"/") {
@@ -349,9 +383,9 @@ func validateRepositoryReference(repository string) error {
 	return nil
 }
 
-func normalizeRegistry(registry string) string {
-	registry = NormalizeRegistry(registry)
-	if isDockerHub(registry) {
+func normalizeRegistryPrefix(registry string) string {
+	registry = RegistryPrefix(registry)
+	if isDockerHub(NormalizeRegistry(registry)) {
 		return ""
 	}
 	return registry

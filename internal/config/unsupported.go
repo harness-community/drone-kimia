@@ -8,7 +8,6 @@ import (
 )
 
 var unsupportedInputs = []string{
-	"PLUGIN_SNAPSHOT_MODE",
 	"PLUGIN_CACHE_TTL",
 	"PLUGIN_CACHE_DIR",
 	"PLUGIN_CACHE_COPY_LAYERS",
@@ -35,8 +34,6 @@ var unsupportedInputs = []string{
 	"PLUGIN_IMAGE_FS_EXTRACT_RETRY",
 	"PLUGIN_IMAGE_DOWNLOAD_RETRY",
 	"PLUGIN_IMAGE_NAME_TAG_WITH_DIGEST_FILE",
-	"PLUGIN_PUSH_ONLY",
-	"PLUGIN_SOURCE_TAR_PATH",
 	"PLUGIN_MIRROR",
 	"DOCKER_PLUGIN_MIRROR",
 	"PLUGIN_REGISTRY_MIRRORS",
@@ -51,7 +48,6 @@ var unsupportedInputs = []string{
 	"PLUGIN_EXPERIMENTAL",
 	"PLUGIN_DEBUG",
 	"DOCKER_LAUNCH_DEBUG",
-	"PLUGIN_DAEMON_OFF",
 	"PLUGIN_DAEMON_RETRY_COUNT",
 	"PLUGIN_SQUASH",
 	"PLUGIN_COMPRESS",
@@ -89,7 +85,6 @@ var unsupportedInputs = []string{
 	"PLUGIN_USE_LOADED_BUILDKIT",
 	"PLUGIN_BUILDKIT_ASSETS_DIR",
 	"PLUGIN_BUILDKIT_VERSION",
-	"PLUGIN_METADATA_FILE",
 	"PLUGIN_CACHE_METRICS_FILE",
 	"PLUGIN_PATH_STYLE",
 	"AWS_PLUGIN_PATH_STYLE",
@@ -108,6 +103,27 @@ var unsupportedInputs = []string{
 }
 
 func ValidateUnsupportedEnvironment() error {
+	// Harness injects this for VM build-and-push steps. Kimia never starts or
+	// contacts a Docker daemon, so true already describes its runtime. False
+	// would request the daemon-starting behavior of the Docker plugins and has
+	// no truthful Kimia equivalent.
+	if value := strings.TrimSpace(os.Getenv("PLUGIN_DAEMON_OFF")); value != "" {
+		disabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("PLUGIN_DAEMON_OFF must be a boolean: %w", err)
+		}
+		if !disabled {
+			return fmt.Errorf("PLUGIN_DAEMON_OFF=false is not supported; Kimia is always daemonless and cannot start a Docker daemon")
+		}
+	}
+
+	// Harness injects redo for its Kaniko snapshot optimization. BuildKit owns
+	// snapshotting internally, so the value is accepted as a compatibility
+	// no-op; accepting any other mode would silently change its meaning.
+	if value := strings.TrimSpace(os.Getenv("PLUGIN_SNAPSHOT_MODE")); value != "" && value != "redo" {
+		return fmt.Errorf("PLUGIN_SNAPSHOT_MODE=%q is not supported; only redo is accepted as a BuildKit compatibility no-op", value)
+	}
+
 	for _, key := range unsupportedInputs {
 		value, ok := os.LookupEnv(key)
 		if !ok || strings.TrimSpace(value) == "" || explicitlyFalse(value) {

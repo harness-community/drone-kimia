@@ -46,6 +46,36 @@ func TestResolve(t *testing.T) {
 			},
 		},
 		{
+			name: "GAR project namespace expansion",
+			input: Input{
+				Registry:            "us-central1-docker.pkg.dev/example-project",
+				Repository:          "sample-app",
+				Tags:                []string{"test"},
+				ForceRegistryPrefix: true,
+			},
+			want: Result{
+				Repository:   "us-central1-docker.pkg.dev/example-project/sample-app",
+				Tags:         []string{"test"},
+				Destinations: []string{"us-central1-docker.pkg.dev/example-project/sample-app:test"},
+				Images:       []Image{{Repository: "us-central1-docker.pkg.dev/example-project/sample-app", Tag: "test", Reference: "us-central1-docker.pkg.dev/example-project/sample-app:test"}},
+			},
+		},
+		{
+			name: "fully qualified GAR repository is not duplicated",
+			input: Input{
+				Registry:            "us-central1-docker.pkg.dev/example-project",
+				Repository:          "us-central1-docker.pkg.dev/example-project/sample-app",
+				Tags:                []string{"test"},
+				ForceRegistryPrefix: true,
+			},
+			want: Result{
+				Repository:   "us-central1-docker.pkg.dev/example-project/sample-app",
+				Tags:         []string{"test"},
+				Destinations: []string{"us-central1-docker.pkg.dev/example-project/sample-app:test"},
+				Images:       []Image{{Repository: "us-central1-docker.pkg.dev/example-project/sample-app", Tag: "test", Reference: "us-central1-docker.pkg.dev/example-project/sample-app:test"}},
+			},
+		},
+		{
 			name: "does not duplicate custom registry",
 			input: Input{
 				Registry:         "registry.example.com",
@@ -193,6 +223,7 @@ func TestResolveRejectsInvalidInput(t *testing.T) {
 		{name: "invalid tag", input: Input{Repository: "example/app", Tags: []string{"not/a/tag"}}, message: "invalid image tag"},
 		{name: "direct missing tag", input: Input{Direct: []string{"registry.example.com/team/app"}}, message: "explicit tag"},
 		{name: "forced prefix missing registry", input: Input{Repository: "example/app", Tags: []string{"latest"}, ForceRegistryPrefix: true}, message: "registry is required"},
+		{name: "fully qualified repository uses another host", input: Input{Registry: "one.example/project", Repository: "two.example/project/app", Tags: []string{"latest"}, ForceRegistryPrefix: true}, message: "does not match repository registry"},
 	}
 
 	for _, test := range tests {
@@ -261,6 +292,43 @@ func TestReconcileRegistry(t *testing.T) {
 	}
 	if _, err := ReconcileRegistry("https://index.docker.io/v1/", "attacker.example"); err == nil {
 		t.Fatal("ReconcileRegistry() rebound explicit Docker Hub credentials to a custom registry")
+	}
+
+	got, err = ReconcileRegistry("us-central1-docker.pkg.dev/example-project", "us-central1-docker.pkg.dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "us-central1-docker.pkg.dev/example-project" {
+		t.Fatalf("ReconcileRegistry() = %q, want GAR project prefix", got)
+	}
+	if host := NormalizeRegistry(got); host != "us-central1-docker.pkg.dev" {
+		t.Fatalf("NormalizeRegistry() = %q, want GAR authentication host", host)
+	}
+}
+
+func TestQualifyRepositoryWithRegistryNamespace(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		repository string
+		want       string
+	}{
+		{name: "unqualified repository", repository: "cache", want: "us-central1-docker.pkg.dev/example-project/cache"},
+		{name: "qualified repository", repository: "us-central1-docker.pkg.dev/example-project/cache", want: "us-central1-docker.pkg.dev/example-project/cache"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := QualifyRepository("us-central1-docker.pkg.dev/example-project", test.repository, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("QualifyRepository() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

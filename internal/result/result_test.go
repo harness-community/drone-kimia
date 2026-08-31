@@ -65,6 +65,20 @@ func TestReadDigestTrimsNewline(t *testing.T) {
 	}
 }
 
+func TestWriteDigestCreatesParentAndRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "digest")
+	if err := WriteDigest(path, " sha256:abc \n"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadDigest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "sha256:abc" {
+		t.Fatalf("digest = %q", got)
+	}
+}
+
 func TestRegistryType(t *testing.T) {
 	t.Parallel()
 	for provider, want := range map[string]string{
