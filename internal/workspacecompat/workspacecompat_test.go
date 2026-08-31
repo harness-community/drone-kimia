@@ -337,6 +337,8 @@ func TestCleanupAndFinalizeAreIdempotent(t *testing.T) {
 	home, workspace := testLayout(t)
 	t.Chdir(workspace)
 	t.Setenv("HOME", home)
+	t.Setenv("HARNESS_WORKSPACE", workspace)
+	t.Setenv("DRONE_WORKSPACE", "")
 
 	plan, err := Prepare(Input{
 		Context:    ".",
