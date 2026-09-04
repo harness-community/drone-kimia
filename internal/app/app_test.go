@@ -390,6 +390,17 @@ func TestRunNormalPushWithoutDigestOutputsSkipsRegistryLookup(t *testing.T) {
 	t.Setenv("KIMIA_EXECUTABLE", fakeKimia)
 	t.Setenv("DOCKER_CONFIG", filepath.Join(temporary, "docker"))
 	t.Setenv("PLUGIN_DESTINATIONS", "registry.example/team/app:test")
+	// Harness Run steps can inject DRONE_OUTPUT into the test process. Clear
+	// every result path so this test exercises the normal-push/no-output path
+	// independently of its CI environment.
+	for _, key := range []string{
+		"PLUGIN_DIGEST_FILE",
+		"PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE",
+		"PLUGIN_ARTIFACT_FILE",
+		"DRONE_OUTPUT",
+	} {
+		t.Setenv(key, "")
+	}
 	clearProxyEnvironment(t)
 	rejectRegistryDigestResolution(t)
 
