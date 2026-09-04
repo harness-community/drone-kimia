@@ -7,7 +7,7 @@ pipeline:
   properties:
     ci:
       codebase:
-        connectorRef: GitHub_Drone_Org
+        connectorRef: GitHub_Harness_Community_Org
         repoName: drone-kimia
         build: <+input>
         sparseCheckout: []
@@ -117,6 +117,10 @@ pipeline:
                           - linux-amd64
                         caching: false
                         dockerfile: docker/docker/Dockerfile.linux.amd64
+                        buildArgs:
+                          PLUGIN_VERSION: <+codebase.branch>
+                          PLUGIN_REVISION: <+codebase.commitSha>
+                          PLUGIN_CREATED: <+pipeline.startTs>
                       when:
                         stageStatus: Success
                         condition: <+codebase.build.type> == "branch"
@@ -131,6 +135,10 @@ pipeline:
                           - linux-amd64
                         caching: false
                         dockerfile: docker/<+matrix.provider>/Dockerfile.linux.amd64
+                        buildArgs:
+                          PLUGIN_VERSION: <+codebase.branch>
+                          PLUGIN_REVISION: <+codebase.commitSha>
+                          PLUGIN_CREATED: <+pipeline.startTs>
                       when:
                         stageStatus: Success
                         condition: <+codebase.build.type> == "branch"
@@ -248,6 +256,10 @@ pipeline:
                           - linux-arm64
                         caching: false
                         dockerfile: docker/docker/Dockerfile.linux.arm64
+                        buildArgs:
+                          PLUGIN_VERSION: <+codebase.branch>
+                          PLUGIN_REVISION: <+codebase.commitSha>
+                          PLUGIN_CREATED: <+pipeline.startTs>
                       when:
                         stageStatus: Success
                         condition: <+codebase.build.type> == "branch"
@@ -262,6 +274,10 @@ pipeline:
                           - linux-arm64
                         caching: false
                         dockerfile: docker/<+matrix.provider>/Dockerfile.linux.arm64
+                        buildArgs:
+                          PLUGIN_VERSION: <+codebase.branch>
+                          PLUGIN_REVISION: <+codebase.commitSha>
+                          PLUGIN_CREATED: <+pipeline.startTs>
                       when:
                         stageStatus: Success
                         condition: <+codebase.build.type> == "branch"
@@ -293,6 +309,23 @@ pipeline:
             spec: {}
           execution:
             steps:
+              - step:
+                  type: Run
+                  name: Verify Architecture Images
+                  identifier: VerifyArchitectureImages
+                  spec:
+                    connectorRef: Plugins_Docker_Hub_Connector
+                    image: golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514
+                    shell: Sh
+                    envVariables:
+                      KIMIA_RELEASE_TAG: <+codebase.tag>
+                      KIMIA_RELEASE_REVISION: <+codebase.commitSha>
+                      DOCKER_USERNAME: drone
+                      DOCKER_PASSWORD: <+secrets.getValue("Plugins_Docker_Hub_Pat")>
+                    command: go run -mod=readonly ./cmd/release-verify
+                  when:
+                    stageStatus: Success
+                    condition: <+codebase.build.type> == "branch" || <+codebase.build.type> == "tag"
               - step:
                   type: Plugin
                   name: Manifest
