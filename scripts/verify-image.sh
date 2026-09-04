@@ -49,6 +49,9 @@ assert_equal workdir /home/kimia "$(inspect '{{.Config.WorkingDir}}')"
 assert_equal architecture "${arch}" "$(inspect '{{.Architecture}}')"
 assert_equal entrypoint "[\"/usr/local/bin/kimia-${provider}\"]" "$(inspect '{{json .Config.Entrypoint}}')"
 
+tmpdir=$(inspect '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^TMPDIR=//p')
+assert_equal tmpdir "${KIMIA_TMPDIR}" "${tmpdir}"
+
 cmd=$(inspect '{{json .Config.Cmd}}')
 case "${cmd}" in
 	'' | null | '[]') ;;
@@ -59,6 +62,7 @@ assert_equal title "${title}" "$(inspect '{{index .Config.Labels "org.opencontai
 assert_equal source https://github.com/harness-community/drone-kimia "$(inspect '{{index .Config.Labels "org.opencontainers.image.source"}}')"
 assert_equal version "${PLUGIN_VERSION:-dev}" "$(inspect '{{index .Config.Labels "org.opencontainers.image.version"}}')"
 assert_equal revision "${PLUGIN_COMMIT:-unknown}" "$(inspect '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+assert_equal base-name "${KIMIA_BASE_IMAGE}:${KIMIA_VERSION}" "$(inspect '{{index .Config.Labels "org.opencontainers.image.base.name"}}')"
 assert_equal base-digest "${base_digest}" "$(inspect '{{index .Config.Labels "org.opencontainers.image.base.digest"}}')"
 if [ -n "${PLUGIN_CREATED:-}" ]; then
 	assert_equal created "${PLUGIN_CREATED}" "$(inspect '{{index .Config.Labels "org.opencontainers.image.created"}}')"
@@ -93,16 +97,30 @@ if ! "${container_cli}" run --rm \
 	exit 1
 fi
 
-buildkit_output=$("${container_cli}" run --rm --entrypoint buildkitd "${image}" --version)
-case "${buildkit_output}" in
-	*"v${KIMIA_BUILDKIT_VERSION}"*) ;;
-	*) echo "${image}: unexpected BuildKit version: ${buildkit_output}" >&2; exit 1 ;;
+buildah_output=$("${container_cli}" run --rm --entrypoint buildah "${image}" --version)
+case "${buildah_output}" in
+	*"${KIMIA_BUILDAH_VERSION}"*) ;;
+	*) echo "${image}: unexpected Buildah version: ${buildah_output}" >&2; exit 1 ;;
 esac
 
-rootlesskit_output=$("${container_cli}" run --rm --entrypoint rootlesskit "${image}" --version)
-case "${rootlesskit_output}" in
-	*"${KIMIA_ROOTLESSKIT_VERSION}"*) ;;
-	*) echo "${image}: unexpected RootlessKit version: ${rootlesskit_output}" >&2; exit 1 ;;
-esac
+if ! "${container_cli}" run --rm \
+	--entrypoint /bin/sh \
+	-e "KIMIA_EXPECTED_STORAGE_DRIVER=${KIMIA_STORAGE_DRIVER}" \
+	-e "KIMIA_EXPECTED_TMPDIR=${KIMIA_TMPDIR}" \
+	"${image}" \
+	-c '
+		set -eu
+		test "${TMPDIR}" = "${KIMIA_EXPECTED_TMPDIR}"
+		test -d "${TMPDIR}"
+		test -w "${TMPDIR}"
+		grep -Eq "^[[:space:]]*driver[[:space:]]*=[[:space:]]*\"${KIMIA_EXPECTED_STORAGE_DRIVER}\"[[:space:]]*$" /home/kimia/.config/containers/storage.conf
+		test -u /usr/bin/newuidmap
+		test -u /usr/bin/newgidmap
+		grep -qx "kimia:100000:65536" /etc/subuid
+		grep -qx "kimia:100000:65536" /etc/subgid
+	'; then
+	echo "${image}: rootless Buildah VFS, setuid helper, or subordinate-ID contract is invalid" >&2
+	exit 1
+fi
 
 echo "${image}: image and Harness compatibility entrypoint contracts verified"

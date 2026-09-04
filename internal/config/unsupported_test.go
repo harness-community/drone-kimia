@@ -62,3 +62,14 @@ func TestDaemonOffMustBeBoolean(t *testing.T) {
 		t.Fatalf("ValidateUnsupportedEnvironment() error = %q, want boolean guidance", err)
 	}
 }
+
+func TestBuildahInputsAreNotRejectedAsUnsupported(t *testing.T) {
+	t.Setenv("PLUGIN_STORAGE_DRIVER", "vfs")
+	t.Setenv("PLUGIN_INSECURE_PULL", "true")
+	t.Setenv("PLUGIN_IMAGE_DOWNLOAD_RETRY", "2")
+	t.Setenv("PLUGIN_PUSH_RETRY", "3")
+	t.Setenv("PLUGIN_BUILDAH_OPT", "--squash")
+	if err := ValidateUnsupportedEnvironment(); err != nil {
+		t.Fatalf("ValidateUnsupportedEnvironment() rejected Buildah inputs: %v", err)
+	}
+}

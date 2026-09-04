@@ -46,7 +46,9 @@ type Config struct {
 	Insecure           bool
 	InsecurePull       bool
 	InsecureRegistries []string
+	StorageDriver      string
 	ImageDownloadRetry int
+	PushRetry          int
 
 	Verbosity         string
 	LogTimestamp      bool
@@ -55,6 +57,7 @@ type Config struct {
 	Attestation       string
 	Attest            []string
 	BuildKitOpts      []string
+	BuildahOpts       []string
 	Sign              bool
 	CosignKey         string
 	CosignPasswordEnv string
@@ -93,6 +96,7 @@ func Load(provider string) (Config, error) {
 	cfg.ArtifactFile = envutil.First("PLUGIN_ARTIFACT_FILE")
 	cfg.DroneOutput = envutil.First("DRONE_OUTPUT")
 	cfg.Verbosity = firstWithDefault("info", "PLUGIN_VERBOSITY")
+	cfg.StorageDriver = strings.ToLower(strings.TrimSpace(envutil.First("PLUGIN_STORAGE_DRIVER")))
 	cfg.Timestamp = envutil.First("PLUGIN_TIMESTAMP")
 	cfg.Attestation = envutil.First("PLUGIN_ATTESTATION")
 	cfg.CosignKey = envutil.First("PLUGIN_COSIGN_KEY")
@@ -121,6 +125,10 @@ func Load(provider string) (Config, error) {
 		}
 	}
 	cfg.ImageDownloadRetry, err = envutil.Int("PLUGIN_IMAGE_DOWNLOAD_RETRY")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PushRetry, err = envutil.Int("PLUGIN_PUSH_RETRY")
 	if err != nil {
 		return Config{}, err
 	}
@@ -171,6 +179,7 @@ func Load(provider string) (Config, error) {
 	cfg.InsecureRegistries = envutil.CSV(envutil.First("PLUGIN_INSECURE_REGISTRY"))
 	cfg.Attest = envutil.Semicolon(envutil.First("PLUGIN_ATTEST"))
 	cfg.BuildKitOpts = envutil.Semicolon(envutil.First("PLUGIN_BUILDKIT_OPT"))
+	cfg.BuildahOpts = envutil.Semicolon(envutil.First("PLUGIN_BUILDAH_OPT"))
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -200,23 +209,16 @@ func (cfg Config) Validate() error {
 	if cfg.PushOnly && strings.TrimSpace(cfg.SourceTarPath) == "" {
 		return fmt.Errorf("PLUGIN_SOURCE_TAR_PATH is required when PLUGIN_PUSH_ONLY=true")
 	}
-	if cfg.Attestation != "" && len(cfg.Attest) > 0 {
-		return fmt.Errorf("PLUGIN_ATTESTATION conflicts with PLUGIN_ATTEST")
+	switch cfg.StorageDriver {
+	case "", "vfs", "overlay":
+	default:
+		return fmt.Errorf("PLUGIN_STORAGE_DRIVER must be vfs or overlay; got %q", cfg.StorageDriver)
 	}
-	if cfg.Sign && (cfg.CosignKey == "" || (cfg.Attestation == "" && len(cfg.Attest) == 0)) {
-		return fmt.Errorf("PLUGIN_SIGN requires PLUGIN_COSIGN_KEY and an attestation input")
+	if cfg.ImageDownloadRetry < 0 {
+		return fmt.Errorf("PLUGIN_IMAGE_DOWNLOAD_RETRY must be nonnegative")
 	}
-	if !cfg.Sign && (cfg.CosignKey != "" || cfg.CosignPasswordEnv != "") {
-		return fmt.Errorf("PLUGIN_COSIGN_KEY and PLUGIN_COSIGN_PASSWORD_ENV require PLUGIN_SIGN=true")
-	}
-	if cfg.Sign && (cfg.NoPush || cfg.TarPath != "") {
-		return fmt.Errorf("PLUGIN_SIGN requires a registry push; it cannot be combined with build-only or tar export")
-	}
-	if cfg.Sign && cfg.PushOnly {
-		return fmt.Errorf("PLUGIN_SIGN is not supported with PLUGIN_PUSH_ONLY")
-	}
-	if cfg.Sign && strings.EqualFold(strings.TrimSpace(cfg.Attestation), "off") {
-		return fmt.Errorf("PLUGIN_SIGN cannot be combined with PLUGIN_ATTESTATION=off")
+	if cfg.PushRetry < 0 {
+		return fmt.Errorf("PLUGIN_PUSH_RETRY must be nonnegative")
 	}
 	if err := ValidateUnsupportedEnvironment(); err != nil {
 		return err

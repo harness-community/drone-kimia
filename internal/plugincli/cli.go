@@ -80,7 +80,7 @@ func newApplication(options Options, streams app.Streams) (*cli.App, []cli.Flag,
 	flags := append(CommonFlags(), options.ProviderFlags...)
 	application := cli.NewApp()
 	application.Name = "drone-kimia"
-	application.Usage = fmt.Sprintf("BuildKit-only Harness/Drone image builder for %s", strings.ToUpper(provider))
+	application.Usage = fmt.Sprintf("Buildah-only Harness/Drone image builder for %s", strings.ToUpper(provider))
 	application.Description = "Maps existing Drone Docker/Kaniko inputs and native Kimia inputs to RapidFort Kimia."
 	application.Version = fmt.Sprintf(
 		"%s (%s, %s); provider=%s; kimia=%s",

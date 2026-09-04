@@ -1,6 +1,7 @@
 package result
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -37,6 +38,15 @@ func ReadDigest(path string) (string, error) {
 	if digest == "" {
 		return "", fmt.Errorf("digest file %q is empty", path)
 	}
+	// Kimia's Buildah backend writes the local image ID without the algorithm
+	// prefix for build-only and tar exports. Keep the established plugin output
+	// contract by returning the canonical digest form used by Kaniko, registry
+	// pushes, Harness artifacts, and DRONE_OUTPUT.
+	if len(digest) == 64 {
+		if _, err := hex.DecodeString(digest); err == nil {
+			digest = "sha256:" + strings.ToLower(digest)
+		}
+	}
 	return digest, nil
 }
 
@@ -51,8 +61,23 @@ func WriteDigest(path, digest string) error {
 }
 
 func WriteArtifact(path, registryType, registryURL, digest string, destinations []string) error {
+	digests := make(map[string]string, len(destinations))
+	for _, destination := range destinations {
+		digests[destination] = digest
+	}
+	return WriteArtifactWithDigests(path, registryType, registryURL, destinations, digests)
+}
+
+// WriteArtifactWithDigests records the registry manifest digest independently
+// for every pushed destination. Registries may canonicalize or transform a
+// manifest during a push, so callers must not assume all tags share a digest.
+func WriteArtifactWithDigests(path, registryType, registryURL string, destinations []string, digests map[string]string) error {
 	images := make([]Image, 0, len(destinations))
 	for _, destination := range destinations {
+		digest := strings.TrimSpace(digests[destination])
+		if digest == "" {
+			return fmt.Errorf("manifest digest for image destination %q is empty", destination)
+		}
 		images = append(images, Image{Image: destination, Digest: digest})
 	}
 	data, err := json.MarshalIndent(Artifact{
@@ -67,6 +92,20 @@ func WriteArtifact(path, registryType, registryURL, digest string, destinations 
 		return fmt.Errorf("marshal plugin artifact: %w", err)
 	}
 	return writeFile(path, data, 0o644)
+}
+
+// WriteImageNameWithDigest writes an untagged image repository with its
+// verified registry manifest digest, matching Kaniko/Kimia's legacy output.
+func WriteImageNameWithDigest(path, repository, digest string) error {
+	repository = strings.TrimSpace(repository)
+	if repository == "" {
+		return fmt.Errorf("image repository is empty")
+	}
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return fmt.Errorf("image digest is empty")
+	}
+	return writeFile(path, []byte(repository+"@"+digest), 0o644)
 }
 
 func WriteDroneOutput(path, digest, tarPath string) error {

@@ -1,5 +1,5 @@
 // Package workspacecompat adapts ordinary Harness/Drone workspace paths to
-// the path restrictions imposed by RapidFort Kimia's BuildKit backend.
+// the local-context and tar-output restrictions imposed by RapidFort Kimia.
 package workspacecompat
 
 import (

@@ -38,9 +38,9 @@ validate_digest() {
 }
 
 for name in \
-	KIMIA_VERSION KIMIA_SOURCE_COMMIT KIMIA_INDEX_DIGEST \
-	KIMIA_AMD64_DIGEST KIMIA_ARM64_DIGEST KIMIA_BUILDKIT_VERSION \
-	KIMIA_ROOTLESSKIT_VERSION GO_IMAGE DOCKER_PLUGIN_IMAGE \
+	KIMIA_VERSION KIMIA_SOURCE_COMMIT KIMIA_BASE_IMAGE \
+	KIMIA_INDEX_DIGEST KIMIA_AMD64_DIGEST KIMIA_ARM64_DIGEST \
+	KIMIA_BUILDAH_VERSION KIMIA_STORAGE_DRIVER KIMIA_TMPDIR GO_IMAGE DOCKER_PLUGIN_IMAGE \
 	MANIFEST_PLUGIN_IMAGE SMOKE_REGISTRY_IMAGE; do
 	require_value "${name}"
 done
@@ -49,6 +49,13 @@ case "${KIMIA_VERSION}" in
 	[0-9]*.[0-9]*.[0-9]*) ;;
 	*) fail "KIMIA_VERSION must be a semantic version without a v prefix" ;;
 esac
+
+[ "${KIMIA_BASE_IMAGE}" = "ghcr.io/rapidfort/kimia-bud" ] \
+	|| fail "KIMIA_BASE_IMAGE must select the pinned RapidFort Buildah variant"
+[ "${KIMIA_STORAGE_DRIVER}" = "vfs" ] \
+	|| fail "KIMIA_STORAGE_DRIVER must remain vfs for the rootless Buildah image"
+[ "${KIMIA_TMPDIR}" = "/dev/shm" ] \
+	|| fail "KIMIA_TMPDIR must use the OCI tmpfs to avoid nested-overlay context failures"
 
 [ "${#KIMIA_SOURCE_COMMIT}" -eq 40 ] || fail "KIMIA_SOURCE_COMMIT must contain 40 hexadecimal characters"
 case "${KIMIA_SOURCE_COMMIT}" in
@@ -93,12 +100,14 @@ for provider in docker gar ecr acr; do
 		dockerfile="docker/${provider}/Dockerfile.linux.${arch}"
 		[ -f "${dockerfile}" ] || fail "missing ${dockerfile}"
 		[ "$(grep -c '^FROM ' "${dockerfile}")" -eq 1 ] || fail "${dockerfile} must have exactly one FROM"
-		require_contains "${dockerfile}" "FROM ghcr.io/rapidfort/kimia:${KIMIA_VERSION}@${digest}"
+		require_contains "${dockerfile}" "FROM ${KIMIA_BASE_IMAGE}:${KIMIA_VERSION}@${digest}"
 		require_contains "${dockerfile}" "ENV KIMIA_VERSION=${KIMIA_VERSION}"
+		require_contains "${dockerfile}" "TMPDIR=${KIMIA_TMPDIR}"
 		require_contains "${dockerfile}" "org.opencontainers.image.title=\"${title}\""
 		require_contains "${dockerfile}" 'org.opencontainers.image.source="https://github.com/harness-community/drone-kimia"'
 		require_contains "${dockerfile}" 'org.opencontainers.image.version="${PLUGIN_VERSION}"'
 		require_contains "${dockerfile}" 'org.opencontainers.image.revision="${PLUGIN_REVISION}"'
+		require_contains "${dockerfile}" "org.opencontainers.image.base.name=\"${KIMIA_BASE_IMAGE}:${KIMIA_VERSION}\""
 		require_contains "${dockerfile}" "org.opencontainers.image.base.digest=\"${digest}\""
 		require_contains "${dockerfile}" "COPY release/linux/${arch}/kimia-${provider} /usr/local/bin/kimia-${provider}"
 		require_contains "${dockerfile}" "USER 0:0"
@@ -106,6 +115,7 @@ for provider in docker gar ecr acr; do
 		require_contains "${dockerfile}" "&& ln -s /usr/local/bin/kimia-${provider} /kaniko/kaniko-${provider}"
 		require_contains "${dockerfile}" "USER 1000:1000"
 		require_contains "${dockerfile}" "RUN test \"\$(id -u):\$(id -g)\" = \"1000:1000\""
+		require_contains "${dockerfile}" "test \"\${TMPDIR}\" = \"${KIMIA_TMPDIR}\""
 		require_contains "${dockerfile}" "&& test \"\$(readlink /kaniko/kaniko-${provider})\" = \"/usr/local/bin/kimia-${provider}\""
 		require_contains "${dockerfile}" "&& test ! -w /kaniko"
 		require_contains "${dockerfile}" "&& /kaniko/kaniko-${provider} --version"
@@ -113,6 +123,12 @@ for provider in docker gar ecr acr; do
 		require_contains "${dockerfile}" "--help | grep -q \"PLUGIN_PUSH_ONLY\""
 		require_contains "${dockerfile}" "--help | grep -q \"PLUGIN_DAEMON_OFF\""
 		require_contains "${dockerfile}" "--help | grep -q \"${auth_help_input}\""
+		require_contains "${dockerfile}" "buildah --version | grep -q \"${KIMIA_BUILDAH_VERSION}\""
+		require_contains "${dockerfile}" "driver[[:space:]]*=[[:space:]]*\"${KIMIA_STORAGE_DRIVER}\""
+		require_contains "${dockerfile}" "test -u /usr/bin/newuidmap"
+		require_contains "${dockerfile}" "test -u /usr/bin/newgidmap"
+		require_contains "${dockerfile}" "grep -qx 'kimia:100000:65536' /etc/subuid"
+		require_contains "${dockerfile}" "grep -qx 'kimia:100000:65536' /etc/subgid"
 		require_contains "${dockerfile}" "ENTRYPOINT [\"/usr/local/bin/kimia-${provider}\"]"
 		require_contains "${dockerfile}" "CMD []"
 		last_user=$(awk '/^USER[[:space:]]+/ { user = $0 } END { print user }' "${dockerfile}")
@@ -137,6 +153,7 @@ for harness_file in \
 done
 
 require_contains .harness/harness.yaml "identifier: dronekimiaharness"
+require_contains .harness/harness.yaml "connectorRef: GitHub_Harness_Community_Org"
 require_contains .harness/harness.yaml "repoName: drone-kimia"
 require_contains .harness/harness.yaml "image: ${GO_IMAGE}"
 require_contains .harness/harness.yaml "image: ${DOCKER_PLUGIN_IMAGE}"
@@ -156,6 +173,33 @@ require_contains .harness/harness.yaml 'PLUGIN_VERSION=<+codebase.tag>'
 require_contains .harness/harness.yaml 'PLUGIN_REVISION=<+codebase.commitSha>'
 require_contains .harness/harness.yaml 'PLUGIN_CREATED=<+pipeline.startTs>'
 require_contains .harness/harness.yaml 'ignore_missing: "false"'
+require_contains .harness/harness.yaml 'identifier: VerifyArchitectureImages'
+require_contains .harness/harness.yaml 'command: go run -mod=readonly ./cmd/release-verify'
+require_contains .harness/harness.yaml 'KIMIA_RELEASE_TAG: <+codebase.tag>'
+require_contains .harness/harness.yaml 'KIMIA_RELEASE_REVISION: <+codebase.commitSha>'
+require_contains .harness/harness.yaml 'DOCKER_USERNAME: drone'
+require_contains .harness/harness.yaml 'DOCKER_PASSWORD: <+secrets.getValue("Plugins_Docker_Hub_Pat")>'
+
+branch_build_arg_count=$(grep -c 'PLUGIN_REVISION: <+codebase.commitSha>' .harness/harness.yaml)
+[ "${branch_build_arg_count}" -eq 4 ] || fail '.harness/harness.yaml must stamp the revision into all four branch image builds'
+
+verify_step_line=$(grep -n 'identifier: VerifyArchitectureImages' .harness/harness.yaml | cut -d: -f1)
+manifest_step_line=$(grep -n '                  identifier: Manifest$' .harness/harness.yaml | cut -d: -f1)
+[ -n "${verify_step_line}" ] && [ -n "${manifest_step_line}" ] && [ "${verify_step_line}" -lt "${manifest_step_line}" ] \
+	|| fail '.harness/harness.yaml must verify registry images before publishing manifests'
+
+require_contains internal/releaseverify/releaseverify.go 'architectures = []string{"amd64", "arm64"}'
+require_contains internal/releaseverify/releaseverify.go 'verifyUniqueDigests(verified)'
+require_contains internal/releaseverify/releaseverify.go 'config.Config.Labels["org.opencontainers.image.revision"]'
+require_contains internal/releaseverify/releaseverify.go 'remote.WithAuth(authenticator)'
+require_contains internal/releaseverify/releaseverify.go 'verifyCompatibilityEntrypoint(image, provider)'
+require_contains internal/releaseverify/releaseverify.go 'aliasPath := "kaniko/kaniko-" + provider.name'
+require_contains internal/releaseverify/releaseverify.go 'binaryPath := "usr/local/bin/kimia-" + provider.name'
+require_contains cmd/release-verify/main.go 'Password:         os.Getenv("DOCKER_PASSWORD")'
+
+if grep -Fq -- 'DOCKER_PASSWORD}' .harness/harness.yaml; then
+	fail '.harness/harness.yaml must not interpolate the registry password into the verification command'
+fi
 
 if grep -Fq -- '<+matrix.image>' .harness/harness.yaml; then
 	fail '.harness/harness.yaml must not use the cross-product image/repo publish matrix'

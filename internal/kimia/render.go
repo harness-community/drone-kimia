@@ -1,10 +1,11 @@
 // Package kimia renders the normalized plugin configuration as a Kimia CLI
 // invocation. It intentionally emits only options that affect Kimia's
-// BuildKit backend in v1.0.26.
+// Buildah backend in v1.0.26.
 package kimia
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/harness-community/drone-kimia/internal/config"
@@ -16,7 +17,7 @@ type Command struct {
 	Args []string
 }
 
-// Render builds a deterministic Kimia v1.0.26 BuildKit command. Destinations
+// Render builds a deterministic Kimia v1.0.26 Buildah command. Destinations
 // should come from destination.Resolve so the same resolved values can be used
 // for artifact metadata.
 func Render(cfg config.Config, destinations []string) (Command, error) {
@@ -32,7 +33,12 @@ func Render(cfg config.Config, destinations []string) (Command, error) {
 
 // Arguments returns the argv following the Kimia executable.
 func Arguments(cfg config.Config, destinations []string) ([]string, error) {
-	if err := validateBuildKitConfig(cfg, destinations); err != nil {
+	if err := validateBuildahConfig(cfg, destinations); err != nil {
+		return nil, err
+	}
+
+	cacheImports, cacheExports, err := buildahCacheRepositories(cfg)
+	if err != nil {
 		return nil, err
 	}
 
@@ -59,18 +65,20 @@ func Arguments(cfg config.Config, destinations []string) ([]string, error) {
 	if cfg.Platform != "" {
 		args = append(args, "--custom-platform="+cfg.Platform)
 	}
+	if cfg.StorageDriver != "" {
+		args = append(args, "--storage-driver="+cfg.StorageDriver)
+	}
 
-	imports, exports := cacheSpecs(cfg)
-	if cfg.DisableCache {
-		args = append(args, "--cache=false")
-	} else if cfg.EnableCache || len(imports) > 0 || len(exports) > 0 {
-		args = append(args, "--cache=true")
+	cacheEnabled := cfg.EnableCache || len(cacheImports) > 0 || len(cacheExports) > 0
+	args = append(args, "--cache="+strconv.FormatBool(cacheEnabled))
+	for _, repository := range cacheImports {
+		args = append(args, "--buildah-opt=--cache-from "+repository)
 	}
-	for _, value := range imports {
-		args = append(args, "--import-cache="+value)
+	for _, repository := range cacheExports {
+		args = append(args, "--buildah-opt=--cache-to "+repository)
 	}
-	for _, value := range exports {
-		args = append(args, "--export-cache="+value)
+	for _, value := range cfg.BuildahOpts {
+		args = append(args, "--buildah-opt="+strings.TrimSpace(value))
 	}
 
 	if cfg.NoPush {
@@ -89,8 +97,17 @@ func Arguments(cfg config.Config, destinations []string) ([]string, error) {
 	if cfg.Insecure {
 		args = append(args, "--insecure")
 	}
+	if cfg.InsecurePull {
+		args = append(args, "--insecure-pull")
+	}
 	for _, value := range cfg.InsecureRegistries {
 		args = append(args, "--insecure-registry="+value)
+	}
+	if cfg.ImageDownloadRetry > 0 {
+		args = append(args, "--image-download-retry="+strconv.Itoa(cfg.ImageDownloadRetry))
+	}
+	if cfg.PushRetry > 0 {
+		args = append(args, "--push-retry="+strconv.Itoa(cfg.PushRetry))
 	}
 
 	if cfg.Verbosity != "" {
@@ -119,57 +136,118 @@ func Arguments(cfg config.Config, destinations []string) ([]string, error) {
 		args = append(args, "--git-token-user="+cfg.GitTokenUser)
 	}
 
-	if cfg.Attestation != "" {
-		args = append(args, "--attestation="+cfg.Attestation)
-	}
-	for _, value := range cfg.Attest {
-		args = append(args, "--attest="+value)
-	}
-	for _, value := range cfg.BuildKitOpts {
-		args = append(args, "--buildkit-opt="+value)
-	}
-	if cfg.Sign {
-		args = append(args, "--sign")
-	}
-	if cfg.CosignKey != "" {
-		args = append(args, "--cosign-key="+cfg.CosignKey)
-	}
-	if cfg.CosignPasswordEnv != "" {
-		args = append(args, "--cosign-password-env="+cfg.CosignPasswordEnv)
-	}
-
 	return args, nil
 }
 
-func cacheSpecs(cfg config.Config) ([]string, []string) {
-	imports := make([]string, 0, len(cfg.ImportCache)+1)
-	for _, value := range cfg.ImportCache {
-		imports = append(imports, normalizeCacheSpec(value, false))
+func buildahCacheRepositories(cfg config.Config) ([]string, []string, error) {
+	imports := append([]string(nil), cfg.ImportCache...)
+	exports := append([]string(nil), cfg.ExportCache...)
+	if strings.TrimSpace(cfg.CacheRepo) != "" {
+		imports = append(imports, cfg.CacheRepo)
+		exports = append(exports, cfg.CacheRepo)
 	}
-	exports := make([]string, 0, len(cfg.ExportCache)+1)
-	for _, value := range cfg.ExportCache {
-		exports = append(exports, normalizeCacheSpec(value, true))
+
+	imports, err := normalizeBuildahCacheList(imports, "import")
+	if err != nil {
+		return nil, nil, err
 	}
-	if cfg.CacheRepo != "" {
-		imports = append(imports, "type=registry,ref="+cfg.CacheRepo)
-		exports = append(exports, "type=registry,ref="+cfg.CacheRepo+",mode=max")
+	exports, err = normalizeBuildahCacheList(exports, "export")
+	if err != nil {
+		return nil, nil, err
 	}
-	return imports, exports
+	return imports, exports, nil
 }
 
-func normalizeCacheSpec(value string, export bool) string {
+func normalizeBuildahCacheList(values []string, direction string) ([]string, error) {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		repository, err := normalizeBuildahCache(value, direction)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[repository]; exists {
+			continue
+		}
+		seen[repository] = struct{}{}
+		result = append(result, repository)
+	}
+	return result, nil
+}
+
+func normalizeBuildahCache(value, direction string) (string, error) {
 	value = strings.TrimSpace(value)
-	if strings.HasPrefix(value, "type=") {
-		return value
+	if value == "" {
+		return "", fmt.Errorf("cache %s entry must not be empty", direction)
 	}
-	spec := "type=registry,ref=" + value
-	if export {
-		spec += ",mode=max"
+	if !strings.ContainsAny(value, "=,") {
+		if err := validateCacheRepository(value); err != nil {
+			return "", fmt.Errorf("invalid cache %s repository %q: %w", direction, value, err)
+		}
+		return value, nil
 	}
-	return spec
+
+	attributes := make(map[string]string)
+	for _, rawAttribute := range strings.Split(value, ",") {
+		attribute := strings.TrimSpace(rawAttribute)
+		key, attributeValue, found := strings.Cut(attribute, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		attributeValue = strings.TrimSpace(attributeValue)
+		if !found || key == "" || attributeValue == "" {
+			return "", fmt.Errorf("malformed cache %s specification %q", direction, value)
+		}
+		if _, duplicate := attributes[key]; duplicate {
+			return "", fmt.Errorf("cache %s specification %q repeats attribute %q", direction, value, key)
+		}
+		attributes[key] = attributeValue
+	}
+
+	cacheType, ok := attributes["type"]
+	if !ok {
+		return "", fmt.Errorf("cache %s specification %q is missing type=registry", direction, value)
+	}
+	if !strings.EqualFold(cacheType, "registry") {
+		return "", fmt.Errorf("cache %s type %q is not supported by Kimia's Buildah backend; only registry caches are supported", direction, cacheType)
+	}
+	for key := range attributes {
+		switch key {
+		case "type", "ref", "mode":
+		default:
+			return "", fmt.Errorf("cache %s specification %q uses unsupported attribute %q", direction, value, key)
+		}
+	}
+	repository, ok := attributes["ref"]
+	if !ok {
+		return "", fmt.Errorf("cache %s specification %q is missing ref", direction, value)
+	}
+	if mode, ok := attributes["mode"]; ok {
+		if mode != "min" && mode != "max" {
+			return "", fmt.Errorf("cache %s specification %q has unsupported mode %q; only min or max is recognized", direction, value, mode)
+		}
+		if direction == "export" && mode == "min" {
+			return "", fmt.Errorf("cache export specification %q requests mode=min, which has no Buildah equivalent; use mode=max or omit mode", value)
+		}
+	}
+	if err := validateCacheRepository(repository); err != nil {
+		return "", fmt.Errorf("invalid cache %s repository %q: %w", direction, repository, err)
+	}
+	return repository, nil
 }
 
-func validateBuildKitConfig(cfg config.Config, destinations []string) error {
+func validateCacheRepository(value string) error {
+	if strings.ContainsAny(value, " \t\r\n") {
+		return fmt.Errorf("repository contains whitespace")
+	}
+	if strings.Contains(value, "://") {
+		return fmt.Errorf("repository must not include a URL scheme")
+	}
+	if strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") {
+		return fmt.Errorf("repository must not begin or end with a slash")
+	}
+	return nil
+}
+
+func validateBuildahConfig(cfg config.Config, destinations []string) error {
 	if cfg.Dockerfile == "" {
 		return fmt.Errorf("Dockerfile path is required")
 	}
@@ -202,20 +280,43 @@ func validateBuildKitConfig(cfg config.Config, destinations []string) error {
 	if cfg.DisableCache && (cfg.EnableCache || cfg.CacheRepo != "" || len(cfg.ImportCache) > 0 || len(cfg.ExportCache) > 0) {
 		return fmt.Errorf("cache is disabled but cache sources or exports were configured")
 	}
+	if cfg.CacheDir != "" {
+		return fmt.Errorf("PLUGIN_CACHE_DIR is not supported by Kimia v1.0.26's Buildah backend")
+	}
+	switch cfg.StorageDriver {
+	case "", "vfs", "overlay":
+	default:
+		return fmt.Errorf("PLUGIN_STORAGE_DRIVER must be vfs or overlay; got %q", cfg.StorageDriver)
+	}
+	if cfg.ImageDownloadRetry < 0 {
+		return fmt.Errorf("PLUGIN_IMAGE_DOWNLOAD_RETRY must be nonnegative")
+	}
+	if cfg.PushRetry < 0 {
+		return fmt.Errorf("PLUGIN_PUSH_RETRY must be nonnegative")
+	}
+	for index, value := range cfg.BuildahOpts {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("PLUGIN_BUILDAH_OPT value %d must not be empty", index)
+		}
+	}
 
-	// Kimia v1.0.26 parses these fields, but its BuildKit implementation does
-	// not consume them. Failing here avoids a successful-looking no-op.
+	// Kimia v1.0.26 parses these fields but implements them only in its
+	// BuildKit path. Reject them here instead of launching a successful-looking
+	// Buildah build that silently ignores the request.
 	unsupported := []struct {
 		set  bool
 		name string
 	}{
-		{cfg.CacheDir != "", "PLUGIN_CACHE_DIR"},
-		{cfg.InsecurePull, "PLUGIN_INSECURE_PULL"},
-		{cfg.ImageDownloadRetry != 0, "PLUGIN_IMAGE_DOWNLOAD_RETRY"},
+		{cfg.Attestation != "", "PLUGIN_ATTESTATION"},
+		{len(cfg.Attest) > 0, "PLUGIN_ATTEST"},
+		{len(cfg.BuildKitOpts) > 0, "PLUGIN_BUILDKIT_OPT"},
+		{cfg.Sign, "PLUGIN_SIGN"},
+		{cfg.CosignKey != "", "PLUGIN_COSIGN_KEY"},
+		{cfg.CosignPasswordEnv != "", "PLUGIN_COSIGN_PASSWORD_ENV"},
 	}
 	for _, input := range unsupported {
 		if input.set {
-			return fmt.Errorf("%s is not supported by Kimia v1.0.26's BuildKit backend", input.name)
+			return fmt.Errorf("%s is not supported by Kimia v1.0.26's Buildah backend", input.name)
 		}
 	}
 

@@ -26,20 +26,16 @@ var unsupportedInputs = []string{
 	"PLUGIN_SKIP_TLS_VERIFY",
 	"PLUGIN_SKIP_TLS_VERIFY_PULL",
 	"PLUGIN_SKIP_TLS_VERIFY_REGISTRY",
-	"PLUGIN_INSECURE_PULL",
 	"PLUGIN_USE_NEW_RUN",
 	"PLUGIN_IGNORE_VAR_RUN",
 	"PLUGIN_IGNORE_PATH",
 	"PLUGIN_IGNORE_PATHS",
 	"PLUGIN_IMAGE_FS_EXTRACT_RETRY",
-	"PLUGIN_IMAGE_DOWNLOAD_RETRY",
 	"PLUGIN_IMAGE_NAME_TAG_WITH_DIGEST_FILE",
 	"PLUGIN_MIRROR",
 	"DOCKER_PLUGIN_MIRROR",
 	"PLUGIN_REGISTRY_MIRRORS",
 	"PLUGIN_STORAGE_PATH",
-	"PLUGIN_STORAGE_DRIVER",
-	"PLUGIN_PUSH_RETRY",
 	"PLUGIN_BIP",
 	"PLUGIN_MTU",
 	"PLUGIN_CUSTOM_DNS",
@@ -117,11 +113,12 @@ func ValidateUnsupportedEnvironment() error {
 		}
 	}
 
-	// Harness injects redo for its Kaniko snapshot optimization. BuildKit owns
-	// snapshotting internally, so the value is accepted as a compatibility
-	// no-op; accepting any other mode would silently change its meaning.
+	// Harness injects redo for its Kaniko snapshot optimization. Buildah owns
+	// layer change detection internally, so the value is accepted as a
+	// compatibility no-op; accepting another mode would silently change its
+	// meaning.
 	if value := strings.TrimSpace(os.Getenv("PLUGIN_SNAPSHOT_MODE")); value != "" && value != "redo" {
-		return fmt.Errorf("PLUGIN_SNAPSHOT_MODE=%q is not supported; only redo is accepted as a BuildKit compatibility no-op", value)
+		return fmt.Errorf("PLUGIN_SNAPSHOT_MODE=%q is not supported; only redo is accepted as a Buildah compatibility no-op", value)
 	}
 
 	for _, key := range unsupportedInputs {

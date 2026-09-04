@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,9 +20,12 @@ import (
 	"github.com/harness-community/drone-kimia/internal/config"
 	"github.com/harness-community/drone-kimia/internal/destination"
 	"github.com/harness-community/drone-kimia/internal/kimia"
+	"github.com/harness-community/drone-kimia/internal/registrydigest"
+	"github.com/harness-community/drone-kimia/internal/result"
 )
 
 func TestRunBuildOnlyWritesArtifactAndDroneOutput(t *testing.T) {
+	rejectRegistryDigestResolution(t)
 	temporary := t.TempDir()
 	argumentsPath := filepath.Join(temporary, "arguments")
 	fakeKimia := filepath.Join(temporary, "kimia")
@@ -83,7 +87,56 @@ done
 	}
 }
 
+func TestRunBuildOnlyCanonicalizesBuildahDigestFiles(t *testing.T) {
+	rejectRegistryDigestResolution(t)
+	temporary := t.TempDir()
+	fakeKimia := filepath.Join(temporary, "kimia")
+	imageID := strings.Repeat("A1", 32)
+	script := `#!/bin/sh
+set -eu
+for argument in "$@"; do
+  case "$argument" in
+    --digest-file=*) printf '%s\n' "$IMAGE_ID" > "${argument#*=}" ;;
+  esac
+done
+`
+	if err := os.WriteFile(fakeKimia, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digestPath := filepath.Join(temporary, "digest")
+	imageNamePath := filepath.Join(temporary, "image-name")
+	t.Setenv("IMAGE_ID", imageID)
+	t.Setenv("KIMIA_EXECUTABLE", fakeKimia)
+	t.Setenv("DOCKER_CONFIG", filepath.Join(temporary, "docker"))
+	t.Setenv("PLUGIN_REPO", "registry.example/team/app")
+	t.Setenv("PLUGIN_TAG", "test")
+	t.Setenv("PLUGIN_NO_PUSH", "true")
+	t.Setenv("PLUGIN_DIGEST_FILE", digestPath)
+	t.Setenv("PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE", imageNamePath)
+	clearProxyEnvironment(t)
+
+	if err := Run(context.Background(), "docker", Streams{}); err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := "sha256:" + strings.ToLower(imageID)
+	digestData, err := os.ReadFile(digestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(digestData)); got != wantDigest {
+		t.Fatalf("digest = %q, want %q", got, wantDigest)
+	}
+	imageNameData, err := os.ReadFile(imageNamePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(imageNameData), "registry.example/team/app@"+wantDigest; got != want {
+		t.Fatalf("image name with digest = %q, want %q", got, want)
+	}
+}
+
 func TestRunPushOnlyUsesArchivePublisherAndWritesResults(t *testing.T) {
+	rejectRegistryDigestResolution(t)
 	temporary := t.TempDir()
 	sourceTar := filepath.Join(temporary, "imageci.tar")
 	if err := os.WriteFile(sourceTar, []byte("archive"), 0o600); err != nil {
@@ -139,6 +192,212 @@ func TestRunPushOnlyUsesArchivePublisherAndWritesResults(t *testing.T) {
 	}
 }
 
+func TestRunNormalPushUsesVerifiedManifestDigestsForEveryOutput(t *testing.T) {
+	temporary := t.TempDir()
+	argumentsPath := filepath.Join(temporary, "arguments")
+	fakeKimia := filepath.Join(temporary, "kimia")
+	configDigest := "sha256:" + strings.Repeat("c", 64)
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$ARGUMENTS_PATH"
+for argument in "$@"; do
+  case "$argument" in
+    --digest-file=*) printf '%s\n' "$CONFIG_DIGEST" > "${argument#*=}" ;;
+    --image-name-with-digest-file=*) printf '%s\n' "config@$CONFIG_DIGEST" > "${argument#*=}" ;;
+  esac
+done
+`
+	if err := os.WriteFile(fakeKimia, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	firstDestination := "registry.example/team/app:first"
+	secondDestination := "registry.example/team/app:second"
+	firstDigest := "sha256:" + strings.Repeat("1", 64)
+	secondDigest := "sha256:" + strings.Repeat("2", 64)
+	digestPath := filepath.Join(temporary, "digest")
+	imageNamePath := filepath.Join(temporary, "image-name")
+	artifactPath := filepath.Join(temporary, "artifact.json")
+	outputPath := filepath.Join(temporary, "output.env")
+	sourceConfigDir := filepath.Join(temporary, "source-docker-config")
+	if err := os.MkdirAll(sourceConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("ARGUMENTS_PATH", argumentsPath)
+	t.Setenv("CONFIG_DIGEST", configDigest)
+	t.Setenv("KIMIA_EXECUTABLE", fakeKimia)
+	t.Setenv("DOCKER_CONFIG", sourceConfigDir)
+	t.Setenv("PLUGIN_DESTINATIONS", firstDestination+";"+secondDestination)
+	t.Setenv("PLUGIN_INSECURE", "true")
+	t.Setenv("PLUGIN_INSECURE_REGISTRY", "registry.example,cache.example")
+	t.Setenv("PLUGIN_DIGEST_FILE", digestPath)
+	t.Setenv("PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE", imageNamePath)
+	t.Setenv("PLUGIN_ARTIFACT_FILE", artifactPath)
+	t.Setenv("DRONE_OUTPUT", outputPath)
+	clearProxyEnvironment(t)
+
+	previousResolve := resolveRegistryDigests
+	t.Cleanup(func() { resolveRegistryDigests = previousResolve })
+	var received registrydigest.Options
+	resolveRegistryDigests = func(_ context.Context, options registrydigest.Options) (map[string]string, error) {
+		received = options
+		privateConfigDir := os.Getenv("DOCKER_CONFIG")
+		if privateConfigDir == "" || privateConfigDir == sourceConfigDir {
+			t.Errorf("resolver DOCKER_CONFIG = %q, want private prepared config", privateConfigDir)
+		}
+		if _, err := os.Stat(filepath.Join(privateConfigDir, "config.json")); err != nil {
+			t.Errorf("resolver cannot read prepared Docker config: %v", err)
+		}
+		return map[string]string{
+			firstDestination:  firstDigest,
+			secondDestination: secondDigest,
+		}, nil
+	}
+
+	if err := Run(context.Background(), "docker", Streams{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(received.Destinations, ",") != firstDestination+","+secondDestination {
+		t.Fatalf("resolver destinations = %#v", received.Destinations)
+	}
+	if !received.Insecure || strings.Join(received.InsecureRegistries, ",") != "registry.example,cache.example" {
+		t.Fatalf("resolver insecure options = %#v", received)
+	}
+	arguments, err := os.ReadFile(argumentsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"--digest-file=", "--image-name-with-digest-file="} {
+		if strings.Contains(string(arguments), forbidden) {
+			t.Fatalf("Kimia received untrusted digest output flag %q: %s", forbidden, arguments)
+		}
+	}
+	digestData, err := os.ReadFile(digestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(digestData)); got != firstDigest || got == configDigest {
+		t.Fatalf("digest output = %q, want first manifest digest %q", got, firstDigest)
+	}
+	imageNameData, err := os.ReadFile(imageNamePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(imageNameData), "registry.example/team/app@"+firstDigest; got != want {
+		t.Fatalf("image-name output = %q, want %q", got, want)
+	}
+	artifactData, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact result.Artifact
+	if err := json.Unmarshal(artifactData, &artifact); err != nil {
+		t.Fatal(err)
+	}
+	wantImages := []result.Image{
+		{Image: firstDestination, Digest: firstDigest},
+		{Image: secondDestination, Digest: secondDigest},
+	}
+	if len(artifact.Data.Images) != len(wantImages) {
+		t.Fatalf("artifact images = %#v, want %#v", artifact.Data.Images, wantImages)
+	}
+	for index := range wantImages {
+		if artifact.Data.Images[index] != wantImages[index] {
+			t.Fatalf("artifact image %d = %#v, want %#v", index, artifact.Data.Images[index], wantImages[index])
+		}
+	}
+	output, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output), firstDigest) || strings.Contains(string(output), secondDigest) || strings.Contains(string(output), configDigest) {
+		t.Fatalf("DRONE_OUTPUT did not use the first verified manifest digest: %s", output)
+	}
+}
+
+func TestRunNormalPushWarnsAndSuppressesOutputsWhenVerificationFails(t *testing.T) {
+	temporary := t.TempDir()
+	argumentsPath := filepath.Join(temporary, "arguments")
+	fakeKimia := filepath.Join(temporary, "kimia")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$ARGUMENTS_PATH"
+`
+	if err := os.WriteFile(fakeKimia, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digestPath := filepath.Join(temporary, "digest")
+	imageNamePath := filepath.Join(temporary, "image-name")
+	artifactPath := filepath.Join(temporary, "artifact.json")
+	outputPath := filepath.Join(temporary, "output.env")
+	for path, contents := range map[string]string{
+		digestPath:    "sha256:stale-config",
+		imageNamePath: "stale@sha256:config",
+		artifactPath:  `{"digest":"stale-config"}`,
+		outputPath:    `digest="stale-config"`,
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Setenv("ARGUMENTS_PATH", argumentsPath)
+	t.Setenv("KIMIA_EXECUTABLE", fakeKimia)
+	t.Setenv("DOCKER_CONFIG", filepath.Join(temporary, "docker"))
+	t.Setenv("PLUGIN_DESTINATIONS", "registry.example/team/app:test")
+	t.Setenv("PLUGIN_DIGEST_FILE", digestPath)
+	t.Setenv("PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE", imageNamePath)
+	t.Setenv("PLUGIN_ARTIFACT_FILE", artifactPath)
+	t.Setenv("DRONE_OUTPUT", outputPath)
+	clearProxyEnvironment(t)
+
+	previousResolve := resolveRegistryDigests
+	t.Cleanup(func() { resolveRegistryDigests = previousResolve })
+	resolveRegistryDigests = func(context.Context, registrydigest.Options) (map[string]string, error) {
+		return nil, errors.New("registry temporarily unavailable")
+	}
+
+	var stderr bytes.Buffer
+	if err := Run(context.Background(), "docker", Streams{Stderr: &stderr}); err != nil {
+		t.Fatalf("successful push became a plugin failure: %v", err)
+	}
+	for _, expected := range []string{"image push succeeded", "manifest digest verification failed", "registry temporarily unavailable", "suppressed"} {
+		if !strings.Contains(stderr.String(), expected) {
+			t.Fatalf("warning %q does not contain %q", stderr.String(), expected)
+		}
+	}
+	for _, path := range []string{digestPath, imageNamePath, artifactPath, outputPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("unverified output %q was not suppressed: %v", path, err)
+		}
+	}
+	arguments, err := os.ReadFile(argumentsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(arguments), "--digest-file=") || strings.Contains(string(arguments), "--image-name-with-digest-file=") {
+		t.Fatalf("Kimia received digest output paths despite remote verification: %s", arguments)
+	}
+}
+
+func TestRunNormalPushWithoutDigestOutputsSkipsRegistryLookup(t *testing.T) {
+	temporary := t.TempDir()
+	fakeKimia := filepath.Join(temporary, "kimia")
+	if err := os.WriteFile(fakeKimia, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KIMIA_EXECUTABLE", fakeKimia)
+	t.Setenv("DOCKER_CONFIG", filepath.Join(temporary, "docker"))
+	t.Setenv("PLUGIN_DESTINATIONS", "registry.example/team/app:test")
+	clearProxyEnvironment(t)
+	rejectRegistryDigestResolution(t)
+
+	if err := Run(context.Background(), "docker", Streams{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunGARPreservesHarnessProjectNamespace(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "harness")
@@ -187,6 +446,13 @@ done
 	t.Setenv("PLUGIN_SNAPSHOT_MODE", "redo")
 	t.Setenv("PLUGIN_METADATA_FILE", "/addon/tmp/buildx-metadata.json")
 	clearProxyEnvironment(t)
+	previousResolve := resolveRegistryDigests
+	t.Cleanup(func() { resolveRegistryDigests = previousResolve })
+	resolveRegistryDigests = func(_ context.Context, options registrydigest.Options) (map[string]string, error) {
+		return map[string]string{
+			options.Destinations[0]: "sha256:gar-manifest",
+		}, nil
+	}
 
 	if err := Run(context.Background(), "gar", Streams{}); err != nil {
 		t.Fatal(err)
@@ -197,8 +463,9 @@ done
 	}
 	for _, expected := range []string{
 		"--destination=us-central1-docker.pkg.dev/example-project/sample-app:test",
-		"--import-cache=type=registry,ref=us-central1-docker.pkg.dev/example-project/cache",
-		"--export-cache=type=registry,ref=us-central1-docker.pkg.dev/example-project/cache,mode=max",
+		"--cache=true",
+		"--buildah-opt=--cache-from us-central1-docker.pkg.dev/example-project/cache",
+		"--buildah-opt=--cache-to us-central1-docker.pkg.dev/example-project/cache",
 	} {
 		if !strings.Contains(string(arguments), expected) {
 			t.Fatalf("arguments %q do not contain %q", arguments, expected)
@@ -212,7 +479,7 @@ done
 	for _, expected := range []string{
 		`"registryUrl": "us-central1-docker.pkg.dev/example-project"`,
 		`"image": "us-central1-docker.pkg.dev/example-project/sample-app:test"`,
-		`"digest": "sha256:gar-build"`,
+		`"digest": "sha256:gar-manifest"`,
 	} {
 		if !strings.Contains(string(artifact), expected) {
 			t.Fatalf("artifact %q does not contain %q", artifact, expected)
@@ -301,6 +568,7 @@ func assertDockerConfigUsesRegistryHost(t *testing.T, path, registryHost string)
 }
 
 func TestRunAdaptsHarnessWorkspaceAndPublishesRelativeTar(t *testing.T) {
+	rejectRegistryDigestResolution(t)
 	root := t.TempDir()
 	home := filepath.Join(root, "home", "kimia")
 	workspace := filepath.Join(root, "harness")
@@ -520,6 +788,29 @@ func TestRegistryCacheRequiresAuthenticationInBuildOnlyMode(t *testing.T) {
 	}
 }
 
+func TestShouldResolveRegistryDigestsOnlyForNormalPushOutputs(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		cfg  config.Config
+		want bool
+	}{
+		{name: "normal push digest file", cfg: config.Config{DigestFile: "/digest"}, want: true},
+		{name: "normal push image name", cfg: config.Config{ImageNameWithDigestFile: "/image"}, want: true},
+		{name: "normal push artifact", cfg: config.Config{ArtifactFile: "/artifact"}, want: true},
+		{name: "normal push Drone output", cfg: config.Config{DroneOutput: "/output"}, want: true},
+		{name: "normal push without output", cfg: config.Config{}, want: false},
+		{name: "build only", cfg: config.Config{NoPush: true, DigestFile: "/digest"}, want: false},
+		{name: "tar export", cfg: config.Config{TarPath: "/image.tar", DigestFile: "/digest"}, want: false},
+		{name: "push only", cfg: config.Config{PushOnly: true, DigestFile: "/digest"}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldResolveRegistryDigests(test.cfg); got != test.want {
+				t.Fatalf("shouldResolveRegistryDigests() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestGARBuildOnlyRegistryCachePreparesAuthentication(t *testing.T) {
 	temporary := t.TempDir()
 	argumentsPath := filepath.Join(temporary, "arguments")
@@ -552,8 +843,9 @@ cp "$DOCKER_CONFIG/config.json" "$CONFIG_PATH"
 	}
 	for _, expected := range []string{
 		"--no-push",
-		"--import-cache=type=registry,ref=us-central1-docker.pkg.dev/project/cache",
-		"--export-cache=type=registry,ref=us-central1-docker.pkg.dev/project/cache,mode=max",
+		"--cache=true",
+		"--buildah-opt=--cache-from us-central1-docker.pkg.dev/project/cache",
+		"--buildah-opt=--cache-to us-central1-docker.pkg.dev/project/cache",
 	} {
 		if !strings.Contains(string(arguments), expected) {
 			t.Fatalf("arguments %q do not contain %q", arguments, expected)
@@ -602,7 +894,7 @@ cp "$DOCKER_CONFIG/config.json" "$CONFIG_PATH"
 	if !strings.Contains(string(arguments), "--destination=local/check:test") {
 		t.Fatalf("cache registry rewrote build-only destination: %s", arguments)
 	}
-	if !strings.Contains(string(arguments), "ref=cache.example/team/cache") {
+	if !strings.Contains(string(arguments), "--buildah-opt=--cache-from cache.example/team/cache") {
 		t.Fatalf("cache repository missing from Kimia arguments: %s", arguments)
 	}
 	dockerConfig, err := os.ReadFile(configPath)
@@ -761,5 +1053,15 @@ func clearProxyEnvironment(t *testing.T) {
 		"no_proxy", "NO_PROXY", "HARNESS_NO_PROXY",
 	} {
 		t.Setenv(key, "")
+	}
+}
+
+func rejectRegistryDigestResolution(t *testing.T) {
+	t.Helper()
+	previousResolve := resolveRegistryDigests
+	t.Cleanup(func() { resolveRegistryDigests = previousResolve })
+	resolveRegistryDigests = func(context.Context, registrydigest.Options) (map[string]string, error) {
+		t.Fatal("registry digest resolver was called for an excluded operation")
+		return nil, nil
 	}
 }

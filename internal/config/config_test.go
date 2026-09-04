@@ -238,48 +238,72 @@ func TestPlatformMetadataEnvironmentIsIgnored(t *testing.T) {
 	}
 }
 
-func TestIneffectiveBuildKitInputIsRejected(t *testing.T) {
+func TestLoadBuildahInputs(t *testing.T) {
 	t.Setenv("PLUGIN_REPO", "example/app")
-	t.Setenv("PLUGIN_STORAGE_DRIVER", "overlay")
-	_, err := Load("docker")
-	if err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("Load() error = %v", err)
+	t.Setenv("PLUGIN_STORAGE_DRIVER", "VFS")
+	t.Setenv("PLUGIN_INSECURE_PULL", "true")
+	t.Setenv("PLUGIN_IMAGE_DOWNLOAD_RETRY", "3")
+	t.Setenv("PLUGIN_PUSH_RETRY", "4")
+	t.Setenv("PLUGIN_BUILDAH_OPT", "--squash;--jobs 2")
+
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StorageDriver != "vfs" || !cfg.InsecurePull || cfg.ImageDownloadRetry != 3 || cfg.PushRetry != 4 {
+		t.Fatalf("unexpected Buildah config: %#v", cfg)
+	}
+	if want := []string{"--squash", "--jobs 2"}; !reflect.DeepEqual(cfg.BuildahOpts, want) {
+		t.Fatalf("Buildah options = %#v, want %#v", cfg.BuildahOpts, want)
 	}
 }
 
-func TestSigningRequiresPushedAttestation(t *testing.T) {
+func TestLoadRejectsInvalidBuildahInputs(t *testing.T) {
 	tests := []struct {
-		name        string
-		noPush      string
-		tarPath     string
-		attestation string
+		name    string
+		key     string
+		value   string
+		message string
 	}{
-		{name: "build only", noPush: "true", attestation: "sbom"},
-		{name: "tar export", tarPath: "/home/kimia/output/app.tar", attestation: "sbom"},
-		{name: "attestation disabled", attestation: "off"},
+		{name: "native storage", key: "PLUGIN_STORAGE_DRIVER", value: "native", message: "vfs or overlay"},
+		{name: "unknown storage", key: "PLUGIN_STORAGE_DRIVER", value: "zfs", message: "vfs or overlay"},
+		{name: "negative pull retry", key: "PLUGIN_IMAGE_DOWNLOAD_RETRY", value: "-1", message: "nonnegative"},
+		{name: "negative push retry", key: "PLUGIN_PUSH_RETRY", value: "-1", message: "nonnegative"},
 	}
 	for _, test := range tests {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv("PLUGIN_REPO", "example/app")
-			t.Setenv("PLUGIN_SIGN", "true")
-			t.Setenv("PLUGIN_COSIGN_KEY", "key")
-			t.Setenv("PLUGIN_ATTESTATION", test.attestation)
-			t.Setenv("PLUGIN_NO_PUSH", test.noPush)
-			t.Setenv("PLUGIN_TAR_PATH", test.tarPath)
+			t.Setenv(test.key, test.value)
 			_, err := Load("docker")
-			if err == nil {
-				t.Fatal("Load() accepted a signing mode that cannot produce a signature")
+			if err == nil || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("Load() error = %v, want containing %q", err, test.message)
 			}
 		})
 	}
 }
 
-func TestCosignInputsRequireSigning(t *testing.T) {
+func TestLoadStillRejectsCacheDirectory(t *testing.T) {
 	t.Setenv("PLUGIN_REPO", "example/app")
-	t.Setenv("PLUGIN_COSIGN_PASSWORD_ENV", "AWS_SECRET_ACCESS_KEY")
+	t.Setenv("PLUGIN_CACHE_DIR", "/cache")
 	_, err := Load("docker")
-	if err == nil || !strings.Contains(err.Error(), "PLUGIN_SIGN=true") {
-		t.Fatalf("Load() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "PLUGIN_CACHE_DIR") {
+		t.Fatalf("Load() error = %v, want cache directory rejection", err)
+	}
+}
+
+func TestLoadPreservesBuildKitOnlyInputsForRendererRejection(t *testing.T) {
+	t.Setenv("PLUGIN_REPO", "example/app")
+	t.Setenv("PLUGIN_ATTESTATION", "max")
+	t.Setenv("PLUGIN_SIGN", "true")
+	t.Setenv("PLUGIN_COSIGN_KEY", "/secrets/cosign.key")
+	t.Setenv("PLUGIN_COSIGN_PASSWORD_ENV", "COSIGN_PASSWORD")
+
+	cfg, err := Load("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Attestation != "max" || !cfg.Sign || cfg.CosignKey == "" || cfg.CosignPasswordEnv != "COSIGN_PASSWORD" {
+		t.Fatalf("BuildKit-only inputs were not preserved for renderer validation: %#v", cfg)
 	}
 }

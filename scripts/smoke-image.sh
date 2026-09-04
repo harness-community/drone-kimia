@@ -108,6 +108,40 @@ network_created=true
 	"${registry_image}" >/dev/null
 registry_started=true
 
+"${container_cli}" run --rm \
+	--entrypoint /kaniko/kaniko-docker \
+	--workdir /harness \
+	--network "${registry_network}" \
+	-v "${workspace_dir}:/harness" \
+	-e HARNESS_WORKSPACE=/harness \
+	-e DRONE_WORKSPACE=/harness \
+	-e "PLUGIN_REPO=${registry_container}:5000/drone-kimia-smoke" \
+	-e PLUGIN_TAG=normal \
+	-e PLUGIN_INSECURE=true \
+	-e PLUGIN_DIGEST_FILE=/harness/normal-digest \
+	-e PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE=/harness/normal-image-name \
+	-e PLUGIN_ARTIFACT_FILE=/harness/normal-artifact.json \
+	-e DRONE_OUTPUT=/harness/normal-drone.env \
+	"${image}"
+
+"${container_cli}" exec "${registry_container}" \
+	test -f /var/lib/registry/docker/registry/v2/repositories/drone-kimia-smoke/_manifests/tags/normal/current/link || {
+	echo "${image}: normal Kimia build-and-push did not reach the local registry" >&2
+	exit 1
+}
+normal_digest=$(sed -n '1p' "${workspace_dir}/normal-digest")
+printf '%s\n' "${normal_digest}" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+	echo "${image}: normal push did not return a manifest digest" >&2
+	exit 1
+}
+[ "$(cat "${workspace_dir}/normal-image-name")" = "${registry_container}:5000/drone-kimia-smoke@${normal_digest}" ] \
+	&& grep -Fq "digest=\"${normal_digest}\"" "${workspace_dir}/normal-drone.env" \
+	&& grep -Fq "\"image\": \"${registry_container}:5000/drone-kimia-smoke:normal\"" "${workspace_dir}/normal-artifact.json" \
+	&& grep -Fq "\"digest\": \"${normal_digest}\"" "${workspace_dir}/normal-artifact.json" || {
+	echo "${image}: normal push results do not contain the verified registry manifest digest" >&2
+	exit 1
+}
+
 push_attempt=1
 while :; do
 	if "${container_cli}" run --rm \
@@ -150,4 +184,4 @@ done
 	exit 1
 }
 
-echo "${image}: native no-push and unchanged Harness tar-to-push workflow verified"
+echo "${image}: Buildah/VFS no-push, normal push, and unchanged Harness tar-to-push workflow verified"

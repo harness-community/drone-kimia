@@ -72,7 +72,7 @@ type credential struct {
 
 // Prepare merges existing Docker configuration, optional base-image
 // credentials, and provider-specific push credentials into the Docker config
-// consumed by Kimia/BuildKit. Explicit push credentials are written last and
+// consumed by Kimia/Buildah. Explicit push credentials are written last and
 // therefore win when a base-image credential targets the same registry.
 func Prepare(ctx context.Context, opts Options) (Result, error) {
 	provider := Provider(strings.ToLower(strings.TrimSpace(string(opts.Provider))))
@@ -139,9 +139,9 @@ func Prepare(ctx context.Context, opts Options) (Result, error) {
 			}
 			result.PushAuthenticated = true
 		} else if provider == ProviderGAR && result.Registry != "" && !document.hasCredentialMechanism(result.Registry) {
-			// Preserve Kaniko GAR's ambient Workload Identity behavior. Kimia's
-			// BuildKit image bundles docker-credential-gcr, but BuildKit only
-			// invokes it when the Docker config selects the helper.
+			// Preserve Kaniko GAR's ambient Workload Identity behavior. The Kimia
+			// Buildah image bundles docker-credential-gcr, which is invoked only
+			// when the Docker config selects the helper.
 			if err := document.setCredentialHelper(result.Registry, "gcr"); err != nil {
 				return Result{}, err
 			}
@@ -289,7 +289,8 @@ func (document *dockerConfigDocument) setCredential(value credential) error {
 	if err := document.removeCredentialHelper(registry); err != nil {
 		return err
 	}
-	// Docker and BuildKit prefer a global credential store over inline auths.
+	// Docker-compatible consumers can prefer a global credential store over
+	// inline auths.
 	// Remove it whenever connector credentials are overlaid so the explicit
 	// credential written here is actually authoritative.
 	delete(document.raw, "credsStore")

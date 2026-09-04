@@ -6,8 +6,8 @@ import (
 	"github.com/urfave/cli"
 )
 
-// semicolonSlice is repeatable without splitting the commas that belong to a
-// BuildKit specification or build-argument value. It also accepts the native
+// semicolonSlice is repeatable without splitting commas that belong to a cache
+// specification or build-argument value. It also accepts the native
 // semicolon-separated environment syntax used by this wrapper.
 type semicolonSlice struct {
 	values []string
@@ -32,7 +32,7 @@ func (value *semicolonSlice) joined() string {
 	return strings.Join(value.values, ";")
 }
 
-// CommonFlags is the supported BuildKit/Kimia contract shared by all provider
+// CommonFlags is the supported Buildah/Kimia contract shared by all provider
 // images. Provider registry and authentication inputs are intentionally
 // declared in each cmd/kimia-*/main.go.
 func CommonFlags() []cli.Flag {
@@ -143,8 +143,13 @@ func CommonFlags() []cli.Flag {
 			EnvVar: "PLUGIN_PLATFORM,PLUGIN_CUSTOM_PLATFORM",
 		},
 		cli.StringFlag{
+			Name:   "storage-driver",
+			Usage:  "Buildah storage driver: vfs or overlay (blank uses Kimia's VFS default)",
+			EnvVar: "PLUGIN_STORAGE_DRIVER",
+		},
+		cli.StringFlag{
 			Name:   "snapshot-mode",
-			Usage:  "Kaniko compatibility input; redo is accepted as a BuildKit no-op",
+			Usage:  "Kaniko compatibility input; redo is accepted as a Buildah no-op",
 			EnvVar: "PLUGIN_SNAPSHOT_MODE",
 		},
 		cli.BoolFlag{
@@ -154,12 +159,12 @@ func CommonFlags() []cli.Flag {
 		},
 		cli.BoolFlag{
 			Name:   "enable-cache",
-			Usage:  "enable BuildKit caching",
+			Usage:  "enable Buildah layer caching",
 			EnvVar: "PLUGIN_ENABLE_CACHE",
 		},
 		cli.BoolFlag{
 			Name:   "no-cache",
-			Usage:  "disable BuildKit caching",
+			Usage:  "disable Buildah layer caching",
 			EnvVar: "PLUGIN_NO_CACHE",
 		},
 		cli.StringFlag{
@@ -169,25 +174,25 @@ func CommonFlags() []cli.Flag {
 		},
 		cli.GenericFlag{
 			Name:   "cache-from",
-			Usage:  "existing cache sources",
+			Usage:  "cache source repository or type=registry,ref=REPO specification",
 			EnvVar: "PLUGIN_CACHE_FROM",
 			Value:  new(semicolonSlice),
 		},
 		cli.GenericFlag{
 			Name:   "cache-to",
-			Usage:  "semicolon-separated BuildKit cache exports",
+			Usage:  "cache destination repository or type=registry,ref=REPO specification",
 			EnvVar: "PLUGIN_CACHE_TO",
 			Value:  new(semicolonSlice),
 		},
 		cli.GenericFlag{
 			Name:   "import-cache",
-			Usage:  "semicolon-separated native Kimia cache imports",
+			Usage:  "semicolon-separated registry cache imports translated for Buildah",
 			EnvVar: "PLUGIN_IMPORT_CACHE",
 			Value:  new(semicolonSlice),
 		},
 		cli.GenericFlag{
 			Name:   "export-cache",
-			Usage:  "semicolon-separated native Kimia cache exports",
+			Usage:  "semicolon-separated registry cache exports translated for Buildah",
 			EnvVar: "PLUGIN_EXPORT_CACHE",
 			Value:  new(semicolonSlice),
 		},
@@ -241,10 +246,25 @@ func CommonFlags() []cli.Flag {
 			Usage:  "allow insecure registry push behavior",
 			EnvVar: "PLUGIN_INSECURE",
 		},
+		cli.BoolFlag{
+			Name:   "insecure-pull",
+			Usage:  "disable TLS verification while Buildah pulls base images",
+			EnvVar: "PLUGIN_INSECURE_PULL",
+		},
 		cli.StringSliceFlag{
 			Name:   "insecure-registry",
 			Usage:  "registries that may use insecure transport",
 			EnvVar: "PLUGIN_INSECURE_REGISTRY",
+		},
+		cli.IntFlag{
+			Name:   "image-download-retry",
+			Usage:  "number of Buildah base-image pull attempts",
+			EnvVar: "PLUGIN_IMAGE_DOWNLOAD_RETRY",
+		},
+		cli.IntFlag{
+			Name:   "push-retry",
+			Usage:  "number of Buildah registry push attempts",
+			EnvVar: "PLUGIN_PUSH_RETRY",
 		},
 		cli.StringFlag{
 			Name:   "verbosity",
@@ -289,34 +309,40 @@ func CommonFlags() []cli.Flag {
 		},
 		cli.StringFlag{
 			Name:   "attestation",
-			Usage:  "Kimia attestation mode",
+			Usage:  "BuildKit compatibility input; unsupported by the Buildah image",
 			EnvVar: "PLUGIN_ATTESTATION",
 		},
 		cli.GenericFlag{
 			Name:   "attest",
-			Usage:  "semicolon-separated native Kimia attestations",
+			Usage:  "BuildKit compatibility input; unsupported by the Buildah image",
 			EnvVar: "PLUGIN_ATTEST",
 			Value:  new(semicolonSlice),
 		},
 		cli.GenericFlag{
 			Name:   "buildkit-opt",
-			Usage:  "semicolon-separated BuildKit daemon options",
+			Usage:  "BuildKit compatibility input; unsupported by the Buildah image",
 			EnvVar: "PLUGIN_BUILDKIT_OPT",
+			Value:  new(semicolonSlice),
+		},
+		cli.GenericFlag{
+			Name:   "buildah-opt",
+			Usage:  "semicolon-separated flags passed to Kimia's Buildah bud command",
+			EnvVar: "PLUGIN_BUILDAH_OPT",
 			Value:  new(semicolonSlice),
 		},
 		cli.BoolFlag{
 			Name:   "sign",
-			Usage:  "sign the pushed image after attestation",
+			Usage:  "BuildKit compatibility input; unsupported by the Buildah image",
 			EnvVar: "PLUGIN_SIGN",
 		},
 		cli.StringFlag{
 			Name:   "cosign-key",
-			Usage:  "cosign key used to sign the image",
+			Usage:  "BuildKit compatibility input; unsupported by the Buildah image",
 			EnvVar: "PLUGIN_COSIGN_KEY",
 		},
 		cli.StringFlag{
 			Name:   "cosign-password-env",
-			Usage:  "name of the environment variable containing the cosign password",
+			Usage:  "BuildKit compatibility input; unsupported by the Buildah image",
 			EnvVar: "PLUGIN_COSIGN_PASSWORD_ENV",
 		},
 		cli.BoolTFlag{

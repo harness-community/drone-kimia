@@ -17,6 +17,7 @@ import (
 	"github.com/harness-community/drone-kimia/internal/destination"
 	"github.com/harness-community/drone-kimia/internal/envutil"
 	"github.com/harness-community/drone-kimia/internal/kimia"
+	"github.com/harness-community/drone-kimia/internal/registrydigest"
 	"github.com/harness-community/drone-kimia/internal/result"
 	"github.com/harness-community/drone-kimia/internal/workspacecompat"
 )
@@ -24,6 +25,7 @@ import (
 const childShutdownTimeout = 10 * time.Second
 
 var pushImageArchive = archivepush.Push
+var resolveRegistryDigests = registrydigest.Resolve
 
 type Streams struct {
 	Stdin  io.Reader
@@ -145,9 +147,13 @@ func Run(ctx context.Context, provider string, streams Streams) error {
 		}
 	}
 
-	cleanup, err := ensureDigestOutput(&cfg)
-	if err != nil {
-		return err
+	verifyPushedDigests := shouldResolveRegistryDigests(cfg)
+	cleanup := func() {}
+	if !verifyPushedDigests {
+		cleanup, err = ensureDigestOutput(&cfg)
+		if err != nil {
+			return err
+		}
 	}
 	defer cleanup()
 
@@ -168,7 +174,15 @@ func Run(ctx context.Context, provider string, streams Streams) error {
 	cfg.Dockerfile = workspacePlan.Dockerfile
 	cfg.TarPath = workspacePlan.TarPath
 
-	command, err := kimia.Render(cfg, resolved.Destinations)
+	renderConfig := cfg
+	if verifyPushedDigests {
+		// Kimia v1.0.26's Buildah push reports its config blob digest. Do not
+		// let that value reach user-visible output paths; the wrapper writes
+		// verified registry manifest digests after the push succeeds.
+		renderConfig.DigestFile = ""
+		renderConfig.ImageNameWithDigestFile = ""
+	}
+	command, err := kimia.Render(renderConfig, resolved.Destinations)
 	if err != nil {
 		return fmt.Errorf("render Kimia command: %w", err)
 	}
@@ -186,6 +200,24 @@ func Run(ctx context.Context, provider string, streams Streams) error {
 		return fmt.Errorf("publish Kimia workspace outputs: %w", err)
 	}
 	cfg.TarPath = workspacePlan.OriginalTarPath
+
+	if verifyPushedDigests {
+		digests, err := resolveRegistryDigests(ctx, registrydigest.Options{
+			Destinations:       resolved.Destinations,
+			Insecure:           cfg.Insecure,
+			InsecureRegistries: cfg.InsecureRegistries,
+		})
+		if err != nil {
+			suppressUnverifiedResults(cfg, streams.Stderr)
+			warn(streams.Stderr, "image push succeeded but registry manifest digest verification failed; digest-derived outputs were suppressed: %v", err)
+			return nil
+		}
+		if err := writeVerifiedPushResults(cfg, resolved, destinationRegistry, digests, streams.Stderr); err != nil {
+			suppressUnverifiedResults(cfg, streams.Stderr)
+			warn(streams.Stderr, "image push succeeded but registry manifest digest verification was incomplete; digest-derived outputs were suppressed: %v", err)
+		}
+		return nil
+	}
 
 	writeRequestedResults(cfg, resolved, destinationRegistry, streams.Stderr)
 	return nil
@@ -308,7 +340,7 @@ func hasRegistryCache(values []string) bool {
 }
 
 func ensureDigestOutput(cfg *config.Config) (func(), error) {
-	if cfg.DigestFile != "" || (cfg.ArtifactFile == "" && cfg.DroneOutput == "") {
+	if cfg.DigestFile != "" || (cfg.ImageNameWithDigestFile == "" && cfg.ArtifactFile == "" && cfg.DroneOutput == "") {
 		return func() {}, nil
 	}
 	directory, err := os.MkdirTemp("", "drone-kimia-result-*")
@@ -345,14 +377,86 @@ func execute(ctx context.Context, command kimia.Command, streams Streams, cosign
 		defer timer.Stop()
 		select {
 		case <-done:
-			// Kimia may exit before its rootlesskit/buildkitd descendants. Kill
-			// any processes that remain in the isolated process group.
+			// Kimia may exit before its builder descendants. Kill any processes
+			// that remain in the isolated process group.
 			_ = killChild(child.Process)
 		case <-timer.C:
 			_ = killChild(child.Process)
 			<-done
 		}
 		return fmt.Errorf("Kimia build interrupted: %w", ctx.Err())
+	}
+}
+
+func shouldResolveRegistryDigests(cfg config.Config) bool {
+	if cfg.PushOnly || cfg.NoPush || cfg.TarPath != "" {
+		return false
+	}
+	return cfg.DigestFile != "" || cfg.ImageNameWithDigestFile != "" || cfg.ArtifactFile != "" || cfg.DroneOutput != ""
+}
+
+func writeVerifiedPushResults(cfg config.Config, resolved destination.Result, registryURL string, digests map[string]string, stderr io.Writer) error {
+	if len(resolved.Destinations) == 0 || len(resolved.Images) != len(resolved.Destinations) {
+		return fmt.Errorf("resolved image destinations are incomplete")
+	}
+	for _, imageDestination := range resolved.Destinations {
+		if strings.TrimSpace(digests[imageDestination]) == "" {
+			return fmt.Errorf("verified manifest digest for %q is missing", imageDestination)
+		}
+	}
+
+	firstDestination := resolved.Destinations[0]
+	firstDigest := strings.TrimSpace(digests[firstDestination])
+	if cfg.DigestFile != "" {
+		if err := result.WriteDigest(cfg.DigestFile, firstDigest); err != nil {
+			warn(stderr, "could not write verified digest file: %v", err)
+			removeOutput(cfg.DigestFile, "digest", stderr)
+		}
+	}
+	if cfg.ImageNameWithDigestFile != "" {
+		if err := result.WriteImageNameWithDigest(
+			cfg.ImageNameWithDigestFile,
+			resolved.Images[0].Repository,
+			firstDigest,
+		); err != nil {
+			warn(stderr, "could not write verified image name with digest file: %v", err)
+			removeOutput(cfg.ImageNameWithDigestFile, "image name with digest", stderr)
+		}
+	}
+	if cfg.ArtifactFile != "" {
+		if err := result.WriteArtifactWithDigests(
+			cfg.ArtifactFile,
+			result.RegistryType(cfg.Provider),
+			artifactRegistryURL(cfg.Provider, registryURL),
+			resolved.Destinations,
+			digests,
+		); err != nil {
+			warn(stderr, "could not write plugin artifact: %v", err)
+			removeOutput(cfg.ArtifactFile, "plugin artifact", stderr)
+		}
+	}
+	if cfg.DroneOutput != "" {
+		if err := result.WriteDroneOutput(cfg.DroneOutput, firstDigest, cfg.TarPath); err != nil {
+			warn(stderr, "could not write DRONE_OUTPUT: %v", err)
+			removeOutput(cfg.DroneOutput, "DRONE_OUTPUT", stderr)
+		}
+	}
+	return nil
+}
+
+func suppressUnverifiedResults(cfg config.Config, stderr io.Writer) {
+	removeOutput(cfg.DigestFile, "digest", stderr)
+	removeOutput(cfg.ImageNameWithDigestFile, "image name with digest", stderr)
+	removeOutput(cfg.ArtifactFile, "plugin artifact", stderr)
+	removeOutput(cfg.DroneOutput, "DRONE_OUTPUT", stderr)
+}
+
+func removeOutput(path, description string, stderr io.Writer) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		warn(stderr, "could not remove unverified %s output %q: %v", description, path, err)
 	}
 }
 
@@ -397,16 +501,33 @@ func preserveEnvironment(key string) func() {
 }
 
 func writeRequestedResults(cfg config.Config, resolved destination.Result, registryURL string, stderr io.Writer) {
-	if cfg.ArtifactFile == "" && cfg.DroneOutput == "" {
+	if cfg.DigestFile == "" && cfg.ImageNameWithDigestFile == "" && cfg.ArtifactFile == "" && cfg.DroneOutput == "" {
 		return
 	}
 	digest, digestErr := result.ReadDigest(cfg.DigestFile)
 	if digestErr != nil {
 		warn(stderr, "could not read Kimia digest output: %v", digestErr)
 	}
-	if cfg.Provider == string(auth.ProviderDocker) && (registryURL == "" || destination.NormalizeRegistry(registryURL) == "docker.io") {
-		registryURL = "https://index.docker.io/v1/"
+	if cfg.DigestFile != "" && digestErr == nil {
+		if err := result.WriteDigest(cfg.DigestFile, digest); err != nil {
+			warn(stderr, "could not canonicalize Kimia digest output: %v", err)
+			removeOutput(cfg.DigestFile, "digest", stderr)
+		}
 	}
+	if cfg.ImageNameWithDigestFile != "" {
+		if digestErr != nil || len(resolved.Images) == 0 {
+			warn(stderr, "could not write image name with digest without a valid image digest")
+			removeOutput(cfg.ImageNameWithDigestFile, "image name with digest", stderr)
+		} else if err := result.WriteImageNameWithDigest(
+			cfg.ImageNameWithDigestFile,
+			resolved.Images[0].Repository,
+			digest,
+		); err != nil {
+			warn(stderr, "could not write image name with digest: %v", err)
+			removeOutput(cfg.ImageNameWithDigestFile, "image name with digest", stderr)
+		}
+	}
+	registryURL = artifactRegistryURL(cfg.Provider, registryURL)
 	if cfg.ArtifactFile != "" {
 		if digestErr != nil {
 			warn(stderr, "could not write plugin artifact without an image digest")
@@ -425,6 +546,13 @@ func writeRequestedResults(cfg config.Config, resolved destination.Result, regis
 			warn(stderr, "could not write DRONE_OUTPUT: %v", err)
 		}
 	}
+}
+
+func artifactRegistryURL(provider, registryURL string) string {
+	if provider == string(auth.ProviderDocker) && (registryURL == "" || destination.NormalizeRegistry(registryURL) == "docker.io") {
+		return "https://index.docker.io/v1/"
+	}
+	return registryURL
 }
 
 func warn(writer io.Writer, format string, values ...any) {

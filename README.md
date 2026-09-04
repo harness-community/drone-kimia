@@ -1,6 +1,6 @@
 # drone-kimia
 
-`drone-kimia` is a thin Harness/Drone plugin adapter for the BuildKit edition of
+`drone-kimia` is a thin Harness/Drone plugin adapter for the Buildah edition of
 [RapidFort Kimia](https://github.com/rapidfort/kimia). It reads compatible
 `drone-kaniko` and `drone-docker` plugin inputs, prepares standard Docker
 registry authentication, converts supported inputs to Kimia arguments, and
@@ -8,17 +8,20 @@ executes the Kimia binary included in the image.
 
 The initial scope is intentionally small:
 
-- BuildKit only
+- Buildah only, packaged from `ghcr.io/rapidfort/kimia-bud:1.0.26`
 - Docker-compatible registries, GAR, ECR, and ACR
 - Linux amd64 and arm64
 - direct input-to-Kimia mappings, plus narrowly scoped Harness workspace and
   build-to-tar/push-only compatibility
-- no GCR image, Buildah backend, Docker daemon, or implicit engine fallback
+- no GCR image, BuildKit backend, Docker daemon, or implicit engine fallback
 
-BuildKit is the only backend because it is the closest fit for Kaniko's
-daemonless CI use case while retaining modern Dockerfile, cache, multi-platform,
-and OCI output behavior. The plugin does not expose Buildah selection or carry
-a second backend-specific compatibility layer.
+The Buildah image replaces the earlier BuildKit package after RootlessKit could
+not start under the tested Harness Kubernetes security policy. The observed
+BuildKit behavior remains recorded in
+[`docs/harness-buildkit-findings.md`](docs/harness-buildkit-findings.md).
+Buildah removes RootlessKit and the private `buildkitd`, but it is not yet
+declared a universal or zero-setting Kaniko replacement: its rootless user
+namespace behavior still needs validation on the target Harness runners.
 
 ## Images
 
@@ -29,9 +32,32 @@ a second backend-specific compatibility layer.
 | Amazon Elastic Container Registry | `kimia-ecr` | `/kaniko/kaniko-ecr` | `plugins/kimia-ecr` |
 | Azure Container Registry | `kimia-acr` | `/kaniko/kaniko-acr` | `plugins/kimia-acr` |
 
-Every image derives directly from the architecture-specific manifest of Kimia
-v1.0.26. The version and digests are recorded in [`versions.env`](versions.env);
+Every image derives directly from the architecture-specific manifest of
+`ghcr.io/rapidfort/kimia-bud:1.0.26`. The image contains Buildah 1.44.0 and
+defaults to VFS storage. It also sets `TMPDIR=/dev/shm`, so Buildah 1.44's
+temporary context overlay is created on the standard OCI tmpfs instead of
+being nested on the container root filesystem's overlay. The version and
+immutable index/platform digests are recorded in [`versions.env`](versions.env);
 no image consumes an upstream `latest` tag.
+
+The Buildah conversion does not add or alter release-pipeline steps, image
+repositories, tags, manifest topology, or compatibility entrypoints. Its
+packaging changes are confined to the pinned Dockerfile runtime, while the Go
+adapter changes how supported plugin inputs are rendered. At runtime the call
+chain is:
+
+```text
+Harness /kaniko entrypoint
+  -> provider Go wrapper
+  -> input, destination, and authentication normalization
+  -> /usr/local/bin/kimia
+  -> Buildah 1.44.0 (buildah bud, chroot isolation, VFS by default)
+```
+
+The provider wrapper never invokes Buildah directly. For normal builds, Kimia
+detects the `buildah` executable in the packaged image and owns `buildah bud`,
+archive export, and registry push. The deliberately separate push-only flow is
+described below.
 
 ## Plugin CLI contract
 
@@ -91,18 +117,22 @@ or can be resolved before Kimia is invoked.
 | `PLUGIN_CUSTOM_LABELS` | repeated `--label` values |
 | `PLUGIN_TARGET` | `--target` |
 | `PLUGIN_PLATFORM` or `PLUGIN_CUSTOM_PLATFORM` | `--custom-platform` |
-| `PLUGIN_ENABLE_CACHE`, `PLUGIN_NO_CACHE`, `PLUGIN_CACHE_REPO` | enables/disables cache; a cache repository becomes registry import and `mode=max` export specifications |
-| `PLUGIN_CACHE_FROM`, `PLUGIN_CACHE_TO` | raw image references become BuildKit registry cache specifications; values beginning with `type=` pass through |
+| `PLUGIN_ENABLE_CACHE`, `PLUGIN_NO_CACHE` | becomes Kimia `--cache=true` or `--cache=false`, which selects Buildah layer caching or `--no-cache` |
+| `PLUGIN_CACHE_REPO` | enables caching and becomes both Buildah `--cache-from REPO` and `--cache-to REPO` through repeated `--buildah-opt` arguments |
+| `PLUGIN_CACHE_FROM`, `PLUGIN_CACHE_TO` | repository values, or compatible `type=registry,ref=REPO[,mode=max]` specifications, are normalized to Buildah `--cache-from`/`--cache-to` repositories |
 | `PLUGIN_NO_PUSH` or `PLUGIN_DRY_RUN` | `--no-push` |
 | `PLUGIN_TAR_PATH` or `PLUGIN_DESTINATION_TAR_PATH` | exports a Docker archive; relative Harness workspace paths are staged for Kimia and copied back after success |
 | `PLUGIN_PUSH_ONLY`, `PLUGIN_SOURCE_TAR_PATH` | loads a single-image Docker archive and pushes it to the resolved destinations without rebuilding |
-| `PLUGIN_DIGEST_FILE`, `PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE` | corresponding Kimia digest outputs |
+| `PLUGIN_DIGEST_FILE`, `PLUGIN_IMAGE_NAME_WITH_DIGEST_FILE` | Kimia digest outputs for local/tar builds; verified remote manifest digests for normal pushes |
 | `PLUGIN_INSECURE`, `PLUGIN_INSECURE_REGISTRY` | corresponding Kimia registry options |
+| `PLUGIN_INSECURE_PULL` | `--insecure-pull`; disables Buildah TLS verification while pulling build inputs |
+| `PLUGIN_STORAGE_DRIVER` | `--storage-driver=vfs|overlay`; blank uses the packaged VFS default |
+| `PLUGIN_IMAGE_DOWNLOAD_RETRY`, `PLUGIN_PUSH_RETRY` | corresponding nonnegative Kimia retry counts |
 | `PLUGIN_VERBOSITY`, `PLUGIN_LOG_TIMESTAMP` | corresponding Kimia logging options |
 | `PLUGIN_REPRODUCIBLE` | `--reproducible` |
 | `PLUGIN_GIT_BRANCH`, `PLUGIN_GIT_REVISION`, token inputs | corresponding Kimia Git context options |
 | `PLUGIN_ARTIFACT_FILE`, `DRONE_OUTPUT` | wrapper output destinations after a successful build |
-| `PLUGIN_SNAPSHOT_MODE=redo` | accepted as a no-op because Harness injects this Kaniko optimization hint; BuildKit performs its own snapshotting |
+| `PLUGIN_SNAPSHOT_MODE=redo` | accepted as a no-op because Harness injects this Kaniko optimization hint; Buildah performs its own layer change detection |
 | `PLUGIN_DAEMON_OFF=true` | accepted as a no-op because Harness injects it for VM steps and Kimia never starts a Docker daemon; `false` is rejected |
 | `PLUGIN_METADATA_FILE` | accepted and ignored because Harness injects it for GAR |
 | `PLUGIN_ENV_FILE` | loaded before other plugin inputs are evaluated |
@@ -118,37 +148,46 @@ as `PLUGIN_DAEMON_OFF=false` is rejected because it asks Kimia to start a
 Docker daemon. The source of truth is
 [`internal/config/unsupported.go`](internal/config/unsupported.go).
 
-Notable inputs rejected for the BuildKit backend include `PLUGIN_CACHE_DIR`,
-`PLUGIN_INSECURE_PULL`, `PLUGIN_PUSH_RETRY`, `PLUGIN_IMAGE_DOWNLOAD_RETRY`,
-`PLUGIN_REGISTRY_CERTIFICATE`, and `PLUGIN_STORAGE_DRIVER`. Kimia v1.0.26 may
-parse some of these names, but its BuildKit path does not consume them, so the
-wrapper does not report a misleading success.
+Notable inputs still rejected include `PLUGIN_CACHE_DIR`, registry/client
+certificate inputs, TLS-skip aliases, registry and Docker daemon mirrors, and
+engine-specific Kaniko, Docker daemon, or Buildx controls. BuildKit-only
+`PLUGIN_ATTESTATION`, `PLUGIN_ATTEST`, `PLUGIN_BUILDKIT_OPT`, `PLUGIN_SIGN`,
+`PLUGIN_COSIGN_KEY`, and `PLUGIN_COSIGN_PASSWORD_ENV` are also rejected before
+Kimia starts. Kimia v1.0.26's Buildah path does not implement those requests,
+so the wrapper does not report a misleading success.
 
 ## Kimia-native inputs
 
-These inputs expose BuildKit features without pretending they are Kaniko or
-Docker flags. Values containing BuildKit comma-separated specifications use a
-semicolon between repeated specifications.
+These inputs expose Kimia/Buildah behavior without pretending it is a Kaniko or
+Docker flag. Use a semicolon between repeated values when a value itself may
+contain commas.
 
 | Input | Kimia behavior |
 | --- | --- |
 | `PLUGIN_DESTINATIONS` | semicolon-separated complete image destinations; becomes repeated `--destination` |
 | `PLUGIN_CONTEXT_SUB_PATH` | `--context-sub-path` |
-| `PLUGIN_IMPORT_CACHE` | semicolon-separated repeated `--import-cache` specifications |
-| `PLUGIN_EXPORT_CACHE` | semicolon-separated repeated `--export-cache` specifications |
+| `PLUGIN_IMPORT_CACHE` | semicolon-separated registry cache repositories, translated to Buildah `--cache-from` |
+| `PLUGIN_EXPORT_CACHE` | semicolon-separated registry cache repositories, translated to Buildah `--cache-to` |
 | `PLUGIN_TIMESTAMP` | `--timestamp` |
-| `PLUGIN_ATTESTATION` | simple Kimia `--attestation` mode |
-| `PLUGIN_ATTEST` | semicolon-separated repeated `--attest` specifications |
-| `PLUGIN_BUILDKIT_OPT` | semicolon-separated repeated `--buildkit-opt` values |
-| `PLUGIN_SIGN` | enables Kimia signing after its required attestation inputs are supplied |
-| `PLUGIN_COSIGN_KEY` | `--cosign-key` |
-| `PLUGIN_COSIGN_PASSWORD_ENV` | `--cosign-password-env` |
+| `PLUGIN_BUILDAH_OPT` | semicolon-separated values passed through as repeated Kimia `--buildah-opt` arguments |
+| `PLUGIN_STORAGE_DRIVER` | selects `vfs` or `overlay`; blank retains VFS |
+| `PLUGIN_INSECURE_PULL` | Kimia `--insecure-pull` |
+| `PLUGIN_IMAGE_DOWNLOAD_RETRY` | Kimia `--image-download-retry` |
+| `PLUGIN_PUSH_RETRY` | Kimia `--push-retry` |
 
-`PLUGIN_ATTESTATION` and `PLUGIN_ATTEST` are mutually exclusive. Signing
-requires `PLUGIN_COSIGN_KEY`, one of those attestation inputs, and a registry
-push. Signing is rejected with `no_push`, tar export, or
-`PLUGIN_ATTESTATION=off`, because Kimia cannot produce a useful signature in
-those modes.
+`PLUGIN_BUILDAH_OPT` is an escape hatch for a real Buildah `bud` option. Kimia
+validates it and rejects flags that it manages itself, including the
+Dockerfile, destination, build arguments, labels, target, platform, retry,
+cache, isolation, user-namespace, capability, and security options. It should
+not be used to work around the runner's security policy.
+
+Cache inputs accept either a plain repository or the compatibility form
+`type=registry,ref=REPO[,mode=max]`. Only `type=registry` is supported. The
+wrapper extracts `ref` and passes the repository to Buildah. `mode=max` is
+accepted for cache-export compatibility and is not forwarded because Buildah
+already exports its intermediate cache images. Export `mode=min`, local/inline
+cache types, malformed or unknown attributes, and `PLUGIN_CACHE_DIR` fail
+explicitly instead of silently changing semantics.
 
 `PLUGIN_DESTINATIONS` is mutually exclusive with `PLUGIN_REPO`. Every direct
 destination must include a tag, and all direct destinations in one step must
@@ -179,11 +218,13 @@ The wrapper invokes the equivalent of:
   --context /home/kimia/<private-workspace-proxy> \
   --dockerfile Dockerfile \
   --destination registry.example.com/team/app:verify \
+  --cache=false \
   --no-push
 ```
 
 This validates and executes the build, but it does not load the result into a
-Docker daemon. Use tar export when the built image must be retained locally.
+Docker daemon. Kimia detects Buildah and runs `buildah bud` with its chroot
+isolation default. Use tar export when the built image must be retained locally.
 
 ## Tar export and push-only
 
@@ -214,18 +255,23 @@ Equivalent Kimia arguments:
   --context /home/kimia/<private-workspace-proxy> \
   --dockerfile Dockerfile \
   --destination registry.example.com/team/app:verify \
+  --cache=false \
+  --no-push \
   --tar-path /home/kimia/<private-output>/image.tar
 ```
 
-For the BuildKit backend, `--tar-path` selects Docker archive output instead of
-registry push; `no_push` is optional when a tar path is present. Harness already
-mounts `/harness` as the shared workspace for every step, so this workflow does
-not require another shared path or a `/home/kimia` path in the pipeline. The
-workspace must remain writable by the plugin's non-root UID 1000.
+With Buildah, Kimia builds the image locally and exports it through the Docker
+archive transport: `buildah push IMAGE docker-archive:PATH`. `tar_path` selects
+Kimia's archive-export path and skips the normal registry push. Setting
+`no_push: true` as well is recommended because it states the build-only intent
+explicitly and matches the existing Kaniko pipeline pattern. Harness already
+mounts `/harness` as the shared workspace for every step, so this
+workflow does not require another shared path or a `/home/kimia` path in the
+pipeline. The workspace must remain writable by the plugin's non-root UID 1000.
 
-The v1.0.26 archive contains one image but leaves Docker `RepoTags` empty. The
-wrapper does not rely on that field. In a later step, it loads the single image
-and applies the repository and tags supplied by the current plugin step:
+The wrapper does not rely on Docker archive `RepoTags`. In a later step, it
+loads the single image and applies the repository and tags supplied by the
+current plugin step:
 
 ```yaml
 type: Plugin
@@ -242,16 +288,25 @@ Push-only is implemented with the same `go-containerregistry` archive and
 registry flow used by `drone-kaniko`. It reuses the selected Docker, GAR, ECR,
 or ACR authentication, pushes directly over the registry API, and writes the
 normal digest, Harness artifact, and `DRONE_OUTPUT` results. It does not start
-Kimia, BuildKit, Buildah, or a Docker daemon and does not require privileged
-mode. The source must be a regular, single-image Docker archive; zero-image or
-multi-image archives fail before any push.
+Kimia, Buildah, or a Docker daemon and does not require Buildah's user-namespace
+operations. The source must be a regular, single-image Docker archive;
+zero-image or multi-image archives fail before any push.
+
+For a normal build-and-push, Kimia owns both `buildah bud` and the registry
+push. Kimia v1.0.26 reports Buildah's config-blob digest through its digest
+flags, rather than the pushed manifest digest expected by the existing plugin
+contract. When a digest-derived output is requested, the wrapper therefore
+lets Kimia finish the push and then reads the manifest digest back from each
+destination using the same generated Docker authentication config. It writes
+only those verified values to the digest file, image-name file, Harness
+artifact, and `DRONE_OUTPUT`.
 
 ## Registry authentication
 
 There are no Harness connector API calls in this plugin. Harness exposes
 connector material as plugin environment inputs; the provider entrypoint reads
 those inputs and writes the standard Docker config consumed by Kimia and
-BuildKit.
+Buildah.
 
 Authentication is merged in this order:
 
@@ -265,7 +320,7 @@ The destination credential wins when the same host appears more than once.
 The source Docker config is never modified. A private generated directory and
 config file use modes `0700` and `0600`, are passed to Kimia through
 `DOCKER_CONFIG`, and are deleted after the step. Explicit credentials replace
-an incompatible global credential store so BuildKit cannot silently select the
+an incompatible global credential store so Buildah cannot silently select the
 wrong helper.
 
 The shared base-image credential aliases are:
@@ -391,8 +446,7 @@ private cache operations working without forcing a cloud call for a local
 
 After authentication is converted to the private Docker config, raw connector
 passwords, keys, certificates, and OIDC assertions are removed from the Kimia
-subprocess environment. The environment variable explicitly named by
-`PLUGIN_COSIGN_PASSWORD_ENV` is retained when signing is enabled.
+subprocess environment.
 
 `HARNESS_CA_PATH` may be injected by the platform and is ignored rather than
 treated as a requested build feature. This thin adapter does not mutate the
@@ -401,18 +455,27 @@ runtime image or an upstream-supported trust configuration.
 
 ## Cache, TLS, and mirrors
 
-`PLUGIN_CACHE_REPO` maps to a BuildKit registry import plus a `mode=max`
-registry export. `PLUGIN_CACHE_FROM`/`PLUGIN_CACHE_TO` retain their existing
-compatibility syntax, while the native `PLUGIN_IMPORT_CACHE` and
-`PLUGIN_EXPORT_CACHE` inputs accept full BuildKit cache specifications. Use a
-semicolon between repeated specifications because each specification can
-contain commas.
+`PLUGIN_CACHE_REPO` enables Kimia caching and maps the same repository to
+Buildah `--cache-from` and `--cache-to`. `PLUGIN_CACHE_FROM`,
+`PLUGIN_CACHE_TO`, `PLUGIN_IMPORT_CACHE`, and `PLUGIN_EXPORT_CACHE` are reduced
+to registry repository references, deduplicated in input order, and passed as
+repeated `--buildah-opt=--cache-from REPO` or `--buildah-opt=--cache-to REPO`
+arguments. `PLUGIN_NO_CACHE=true` conflicts with any configured cache source or
+destination instead of silently ignoring it.
 
-`PLUGIN_INSECURE` and `PLUGIN_INSECURE_REGISTRY` are passed directly to Kimia.
-The existing registry certificate, client certificate, TLS-skip, registry
-mirror, Docker daemon mirror, and cache-TLS inputs are rejected: Kimia
-v1.0.26's BuildKit path has no effective equivalent for them. The adapter does
-not patch BuildKit configuration or add a sidecar workaround.
+`PLUGIN_INSECURE`, `PLUGIN_INSECURE_PULL`, and
+`PLUGIN_INSECURE_REGISTRY` are passed to Kimia. The existing registry
+certificate, client certificate, TLS-skip aliases, registry mirror, Docker
+daemon mirror, and cache-TLS inputs are rejected because the thin adapter has
+no direct, verified Buildah mapping for them. It does not patch Buildah's
+configuration or add a sidecar workaround.
+
+The packaged default is VFS. The only explicit storage values are `vfs` and
+`overlay`; the older `native` value is rejected by this Buildah package.
+`PLUGIN_STORAGE_DRIVER=overlay` is exposed because Kimia supports it, but it
+changes the runner requirements and is not part of the image-override
+compatibility target. Overlay must be tested separately on the intended
+Kubernetes nodes.
 
 ## Migrating by image override
 
@@ -454,16 +517,22 @@ therefore exposes the matching `/kaniko/kaniko-*` compatibility path as a
 root-owned, read-only alias to the provider's Kimia wrapper. It does not invoke
 Kaniko or change the image's final non-root runtime contract.
 
-For built-in Harness build-and-push steps, no `optimize`, context, tar-path, or
-shared-path workaround is required. Harness's injected
-`PLUGIN_SNAPSHOT_MODE=redo` is accepted as a BuildKit no-op, and its GAR
+At the wrapper level, built-in Harness build-and-push steps do not require an
+`optimize`, context, tar-path, or shared-path workaround. Harness's injected
+`PLUGIN_SNAPSHOT_MODE=redo` is accepted as a Buildah no-op, and its GAR
 `PLUGIN_METADATA_FILE` input is ignored. The adapter transparently exposes the
 existing `/harness` context to Kimia and returns relative tar outputs to that
 same shared workspace. Other nonempty engine-specific inputs remain explicit
-errors when they have no truthful BuildKit equivalent.
+errors when they have no truthful Buildah equivalent.
+
+That input and filesystem compatibility does not prove runtime compatibility.
+The Buildah variant must still pass a zero-setting Harness run on each target
+runner class before it is treated as a drop-in. In particular, the image alias
+cannot change Kubernetes AppArmor, seccomp, user-namespace, capability, or
+`no_new_privs` policy.
 
 VM steps may inject `PLUGIN_DAEMON_OFF=true`; Kimia accepts it because its
-BuildKit flow is already daemonless. Harness's separate DLC/Buildx execution
+Buildah flow is daemonless. Harness's separate DLC/Buildx execution
 mode replaces the executable with `dockerd-entrypoint.sh` and a Buildx binary,
 not merely the image. That fixed Docker-daemon entrypoint is outside the thin
 Kimia compatibility path and must not be overridden with these images.
@@ -475,19 +544,37 @@ The plugin preserves the upstream Kimia image contract:
 - runtime user and group `1000:1000`
 - `HOME=/home/kimia`
 - `WORKDIR=/home/kimia`
-- rootless BuildKit started by Kimia for the duration of the build
-- no Docker daemon and no Buildah fallback
+- Buildah 1.44.0 selected automatically by Kimia
+- VFS storage from `/home/kimia/.config/containers/storage.conf`
+- `TMPDIR=/dev/shm` for Buildah's temporary context-overlay scaffolding
+- chroot isolation selected by Kimia for `buildah bud`
+- setuid `/usr/bin/newuidmap` and `/usr/bin/newgidmap`
+- `kimia:100000:65536` ranges in `/etc/subuid` and `/etc/subgid`
+- no RootlessKit, private `buildkitd`, or Docker daemon
 
 The image does not add `privileged` mode or alter the upstream capability,
 seccomp, AppArmor, or user-namespace requirements. The runner must support the
 rootless user namespaces required by Kimia. Mounted contexts, cache volumes,
 and output volumes must be accessible to UID 1000.
 
-Kimia v1.0.26 starts BuildKit with process sandboxing disabled inside its
-unprivileged container. This avoids privileged mode, but processes launched by
-a Dockerfile `RUN` instruction share the plugin container's process namespace
-boundary. Treat builds as untrusted workloads only on appropriately isolated
-CI runners and re-evaluate this upstream setting on every Kimia upgrade.
+VFS avoids using OverlayFS for image-layer storage and does not require
+`/dev/fuse`; chroot avoids the RootlessKit daemon startup path that failed in
+the earlier Harness test. Buildah 1.44 still creates a short-lived overlay over
+the build context, which is why the image directs its temporary scaffolding to
+`/dev/shm`. None of those choices removes Buildah's need to create user and
+mount namespaces for rootless builds and UID mapping. The runtime can still
+fail when setuid execution is disabled,
+SETUID/SETGID are removed, unprivileged user namespaces are disabled, seccomp
+blocks `clone`/`unshare`, or AppArmor restricts unprivileged user namespaces.
+`privileged: true` alone must not be assumed to correct those independent
+controls.
+
+Before calling this image a Kaniko drop-in, validate on the actual Harness
+Kubernetes infrastructure with no extra stage settings: a simple build, a
+Dockerfile containing `RUN`, multi-stage and `COPY --chown` behavior,
+build-only, build-to-tar followed by push-only, authenticated pull and push,
+and registry caching. Until that matrix passes, the Buildah branch is an
+experimental packaging change rather than a confirmed seamless replacement.
 
 ## Development build
 
@@ -505,6 +592,10 @@ To build all four images for the current host architecture:
 ```sh
 sh scripts/docker.sh
 ```
+
+That command also verifies every provider image contract and runs the Docker
+variant through Buildah/VFS build-only, normal build-and-push, tar export, and
+push-only smoke paths without adding container security flags.
 
 Set `KIMIA_IMAGE_ARCH=amd64|arm64` to select an architecture explicitly and
 `KIMIA_CONTAINER_CLI` to use a Docker-compatible CLI other than `docker`.

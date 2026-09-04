@@ -1,10 +1,11 @@
-FROM ghcr.io/rapidfort/kimia:1.0.26@sha256:7db5d434e54f343963abec53e59c2cf8e73f02f0521784564b66f4e54ea7cf60
+FROM ghcr.io/rapidfort/kimia-bud:1.0.26@sha256:08188e01dfcf90f027d7aeace4b0939150314a512fc893c23b716ba79cce1b83
 
 ARG PLUGIN_VERSION=dev
 ARG PLUGIN_REVISION=unknown
 ARG PLUGIN_CREATED=
 
-ENV KIMIA_VERSION=1.0.26
+ENV KIMIA_VERSION=1.0.26 \
+    TMPDIR=/dev/shm
 
 LABEL org.opencontainers.image.title="drone-kimia-acr" \
       org.opencontainers.image.description="Harness/Drone adapter for RapidFort Kimia using Azure Container Registry authentication" \
@@ -16,8 +17,8 @@ LABEL org.opencontainers.image.title="drone-kimia-acr" \
       org.opencontainers.image.version="${PLUGIN_VERSION}" \
       org.opencontainers.image.revision="${PLUGIN_REVISION}" \
       org.opencontainers.image.created="${PLUGIN_CREATED}" \
-      org.opencontainers.image.base.name="ghcr.io/rapidfort/kimia:1.0.26" \
-      org.opencontainers.image.base.digest="sha256:7db5d434e54f343963abec53e59c2cf8e73f02f0521784564b66f4e54ea7cf60"
+      org.opencontainers.image.base.name="ghcr.io/rapidfort/kimia-bud:1.0.26" \
+      org.opencontainers.image.base.digest="sha256:08188e01dfcf90f027d7aeace4b0939150314a512fc893c23b716ba79cce1b83"
 
 COPY release/linux/amd64/kimia-acr /usr/local/bin/kimia-acr
 
@@ -29,6 +30,9 @@ USER 1000:1000
 
 RUN test "$(id -u):$(id -g)" = "1000:1000" \
     && test "${HOME}" = "/home/kimia" \
+    && test "${TMPDIR}" = "/dev/shm" \
+    && test -d "${TMPDIR}" \
+    && test -w "${TMPDIR}" \
     && test "$(pwd)" = "/home/kimia" \
     && test "$(readlink /kaniko/kaniko-acr)" = "/usr/local/bin/kimia-acr" \
     && test ! -w /kaniko \
@@ -38,8 +42,12 @@ RUN test "$(id -u):$(id -g)" = "1000:1000" \
     && /usr/local/bin/kimia-acr --help | grep -q "PLUGIN_PUSH_ONLY" \
     && /usr/local/bin/kimia-acr --help | grep -q "PLUGIN_DAEMON_OFF" \
     && /usr/local/bin/kimia-acr --help | grep -q "SERVICE_PRINCIPAL_CLIENT_ID" \
-    && buildkitd --version \
-    && rootlesskit --version
+    && buildah --version | grep -q "1.44.0" \
+    && grep -Eq '^[[:space:]]*driver[[:space:]]*=[[:space:]]*"vfs"[[:space:]]*$' /home/kimia/.config/containers/storage.conf \
+    && test -u /usr/bin/newuidmap \
+    && test -u /usr/bin/newgidmap \
+    && grep -qx 'kimia:100000:65536' /etc/subuid \
+    && grep -qx 'kimia:100000:65536' /etc/subgid
 
 ENTRYPOINT ["/usr/local/bin/kimia-acr"]
 CMD []

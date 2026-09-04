@@ -33,6 +33,7 @@ func TestRenderBasicPush(t *testing.T) {
 			"--label=org.example.release=stable",
 			"--target=release",
 			"--custom-platform=linux/arm64",
+			"--cache=false",
 			"--verbosity=info",
 		},
 	}
@@ -55,6 +56,7 @@ func TestArgumentsBuildOnly(t *testing.T) {
 		"--dockerfile=Dockerfile",
 		"--context=/home/kimia/workspace",
 		"--destination=example/app:latest",
+		"--cache=false",
 		"--no-push",
 		"--digest-file=/home/kimia/results/digest",
 		"--verbosity=info",
@@ -80,6 +82,7 @@ func TestArgumentsTarExport(t *testing.T) {
 		"--context=/home/kimia/workspace",
 		"--context-sub-path=services/api",
 		"--destination=example/app:latest",
+		"--cache=false",
 		"--tar-path=/home/kimia/results/app.tar",
 		"--image-name-with-digest-file=/home/kimia/results/image-digest",
 		"--verbosity=info",
@@ -89,13 +92,19 @@ func TestArgumentsTarExport(t *testing.T) {
 	}
 }
 
-func TestArgumentsCache(t *testing.T) {
+func TestArgumentsTranslatesRegistryCacheForBuildah(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
 	cfg.EnableCache = true
-	cfg.CacheRepo = "registry.example.com/team/app-cache:latest"
-	cfg.ImportCache = []string{"type=local,src=/home/kimia/cache"}
-	cfg.ExportCache = []string{"type=inline"}
+	cfg.CacheRepo = "registry.example.com/team/shared-cache:latest"
+	cfg.ImportCache = []string{
+		"registry.example.com/team/import-one:latest",
+		"type=registry,ref=registry.example.com/team/import-two:latest,mode=min",
+	}
+	cfg.ExportCache = []string{
+		"type=registry,ref=registry.example.com/team/export:latest,mode=max",
+	}
+	cfg.BuildahOpts = []string{"--squash", "--jobs 2"}
 
 	got, err := Arguments(cfg, []string{"example/app:latest"})
 	if err != nil {
@@ -106,10 +115,13 @@ func TestArgumentsCache(t *testing.T) {
 		"--context=/home/kimia/workspace",
 		"--destination=example/app:latest",
 		"--cache=true",
-		"--import-cache=type=local,src=/home/kimia/cache",
-		"--import-cache=type=registry,ref=registry.example.com/team/app-cache:latest",
-		"--export-cache=type=inline",
-		"--export-cache=type=registry,ref=registry.example.com/team/app-cache:latest,mode=max",
+		"--buildah-opt=--cache-from registry.example.com/team/import-one:latest",
+		"--buildah-opt=--cache-from registry.example.com/team/import-two:latest",
+		"--buildah-opt=--cache-from registry.example.com/team/shared-cache:latest",
+		"--buildah-opt=--cache-to registry.example.com/team/export:latest",
+		"--buildah-opt=--cache-to registry.example.com/team/shared-cache:latest",
+		"--buildah-opt=--squash",
+		"--buildah-opt=--jobs 2",
 		"--verbosity=info",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -117,11 +129,20 @@ func TestArgumentsCache(t *testing.T) {
 	}
 }
 
-func TestArgumentsNormalizesDockerCacheImages(t *testing.T) {
+func TestArgumentsStableDeduplicatesBuildahCacheRepositories(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
-	cfg.ImportCache = []string{"registry.example.com/team/app:cache"}
-	cfg.ExportCache = []string{"registry.example.com/team/app:cache-next"}
+	cfg.CacheRepo = "registry.example.com/team/cache:latest"
+	cfg.ImportCache = []string{
+		"registry.example.com/team/cache:latest",
+		"type=registry,ref=registry.example.com/team/cache:latest,mode=max",
+		"registry.example.com/team/second:latest",
+	}
+	cfg.ExportCache = []string{
+		"type=registry,ref=registry.example.com/team/cache:latest,mode=max",
+		"registry.example.com/team/second:latest",
+		"registry.example.com/team/cache:latest",
+	}
 
 	got, err := Arguments(cfg, []string{"example/app:latest"})
 	if err != nil {
@@ -132,8 +153,10 @@ func TestArgumentsNormalizesDockerCacheImages(t *testing.T) {
 		"--context=/home/kimia/workspace",
 		"--destination=example/app:latest",
 		"--cache=true",
-		"--import-cache=type=registry,ref=registry.example.com/team/app:cache",
-		"--export-cache=type=registry,ref=registry.example.com/team/app:cache-next,mode=max",
+		"--buildah-opt=--cache-from registry.example.com/team/cache:latest",
+		"--buildah-opt=--cache-from registry.example.com/team/second:latest",
+		"--buildah-opt=--cache-to registry.example.com/team/cache:latest",
+		"--buildah-opt=--cache-to registry.example.com/team/second:latest",
 		"--verbosity=info",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -141,11 +164,55 @@ func TestArgumentsNormalizesDockerCacheImages(t *testing.T) {
 	}
 }
 
-func TestArgumentsKimiaNativeBuildKitOptions(t *testing.T) {
+func TestArgumentsRejectsUnsupportedCacheSpecifications(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		imports       []string
+		exports       []string
+		messagePieces []string
+	}{
+		{name: "local import", imports: []string{"type=local,src=/cache"}, messagePieces: []string{"type \"local\"", "only registry"}},
+		{name: "inline export", exports: []string{"type=inline"}, messagePieces: []string{"type \"inline\"", "only registry"}},
+		{name: "unknown type", imports: []string{"type=s3,ref=bucket"}, messagePieces: []string{"type \"s3\"", "only registry"}},
+		{name: "missing ref", imports: []string{"type=registry,mode=max"}, messagePieces: []string{"missing ref"}},
+		{name: "unsupported mode", exports: []string{"type=registry,ref=example/cache,mode=minimal"}, messagePieces: []string{"unsupported mode", "minimal"}},
+		{name: "minimum export mode", exports: []string{"type=registry,ref=example/cache,mode=min"}, messagePieces: []string{"mode=min", "no Buildah equivalent"}},
+		{name: "unknown attribute", exports: []string{"type=registry,ref=example/cache,compression=zstd"}, messagePieces: []string{"unsupported attribute", "compression"}},
+		{name: "malformed attribute", imports: []string{"type=registry,ref"}, messagePieces: []string{"malformed"}},
+		{name: "duplicate attribute", imports: []string{"type=registry,ref=one,ref=two"}, messagePieces: []string{"repeats attribute", "ref"}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := baseConfig()
+			cfg.ImportCache = test.imports
+			cfg.ExportCache = test.exports
+			_, err := Arguments(cfg, []string{"example/app:latest"})
+			if err == nil {
+				t.Fatal("Arguments() accepted unsupported cache input")
+			}
+			for _, piece := range test.messagePieces {
+				if !strings.Contains(err.Error(), piece) {
+					t.Fatalf("Arguments() error = %q, want containing %q", err, piece)
+				}
+			}
+		})
+	}
+}
+
+func TestArgumentsKimiaNativeBuildahOptions(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
+	cfg.StorageDriver = "vfs"
 	cfg.Insecure = true
+	cfg.InsecurePull = true
 	cfg.InsecureRegistries = []string{"registry.example.com", "cache.example.com:5000"}
+	cfg.ImageDownloadRetry = 3
+	cfg.PushRetry = 4
 	cfg.LogTimestamp = true
 	cfg.Reproducible = true
 	cfg.Timestamp = "1700000000"
@@ -153,11 +220,7 @@ func TestArgumentsKimiaNativeBuildKitOptions(t *testing.T) {
 	cfg.GitRevision = "abc123"
 	cfg.GitTokenFile = "/home/kimia/secrets/git-token"
 	cfg.GitTokenUser = "oauth2"
-	cfg.Attest = []string{"type=sbom,generator=example/scanner:v1"}
-	cfg.BuildKitOpts = []string{"build-arg:EXTRA=value"}
-	cfg.Sign = true
-	cfg.CosignKey = "/home/kimia/secrets/cosign.key"
-	cfg.CosignPasswordEnv = "COSIGN_PASSWORD"
+	cfg.BuildahOpts = []string{"--squash"}
 
 	got, err := Arguments(cfg, []string{"registry.example.com/team/app:latest"})
 	if err != nil {
@@ -167,9 +230,15 @@ func TestArgumentsKimiaNativeBuildKitOptions(t *testing.T) {
 		"--dockerfile=Dockerfile",
 		"--context=/home/kimia/workspace",
 		"--destination=registry.example.com/team/app:latest",
+		"--storage-driver=vfs",
+		"--cache=false",
+		"--buildah-opt=--squash",
 		"--insecure",
+		"--insecure-pull",
 		"--insecure-registry=registry.example.com",
 		"--insecure-registry=cache.example.com:5000",
+		"--image-download-retry=3",
+		"--push-retry=4",
 		"--verbosity=info",
 		"--log-timestamp",
 		"--reproducible",
@@ -178,18 +247,13 @@ func TestArgumentsKimiaNativeBuildKitOptions(t *testing.T) {
 		"--git-revision=abc123",
 		"--git-token-file=/home/kimia/secrets/git-token",
 		"--git-token-user=oauth2",
-		"--attest=type=sbom,generator=example/scanner:v1",
-		"--buildkit-opt=build-arg:EXTRA=value",
-		"--sign",
-		"--cosign-key=/home/kimia/secrets/cosign.key",
-		"--cosign-password-env=COSIGN_PASSWORD",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Arguments() = %#v, want %#v", got, want)
 	}
 }
 
-func TestArgumentsRejectsBuildKitNoOps(t *testing.T) {
+func TestArgumentsRejectsBuildKitOnlyInputs(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -197,9 +261,12 @@ func TestArgumentsRejectsBuildKitNoOps(t *testing.T) {
 		mutate func(*config.Config)
 		input  string
 	}{
-		{name: "cache dir", mutate: func(cfg *config.Config) { cfg.CacheDir = "/cache" }, input: "PLUGIN_CACHE_DIR"},
-		{name: "insecure pull", mutate: func(cfg *config.Config) { cfg.InsecurePull = true }, input: "PLUGIN_INSECURE_PULL"},
-		{name: "download retry", mutate: func(cfg *config.Config) { cfg.ImageDownloadRetry = 2 }, input: "PLUGIN_IMAGE_DOWNLOAD_RETRY"},
+		{name: "attestation", mutate: func(cfg *config.Config) { cfg.Attestation = "max" }, input: "PLUGIN_ATTESTATION"},
+		{name: "attest", mutate: func(cfg *config.Config) { cfg.Attest = []string{"type=sbom"} }, input: "PLUGIN_ATTEST"},
+		{name: "buildkit option", mutate: func(cfg *config.Config) { cfg.BuildKitOpts = []string{"build-arg:EXTRA=value"} }, input: "PLUGIN_BUILDKIT_OPT"},
+		{name: "sign", mutate: func(cfg *config.Config) { cfg.Sign = true }, input: "PLUGIN_SIGN"},
+		{name: "cosign key", mutate: func(cfg *config.Config) { cfg.CosignKey = "/secrets/cosign.key" }, input: "PLUGIN_COSIGN_KEY"},
+		{name: "cosign password environment", mutate: func(cfg *config.Config) { cfg.CosignPasswordEnv = "COSIGN_PASSWORD" }, input: "PLUGIN_COSIGN_PASSWORD_ENV"},
 	}
 
 	for _, test := range tests {
@@ -209,8 +276,8 @@ func TestArgumentsRejectsBuildKitNoOps(t *testing.T) {
 			cfg := baseConfig()
 			test.mutate(&cfg)
 			_, err := Arguments(cfg, []string{"example/app:latest"})
-			if err == nil || !strings.Contains(err.Error(), test.input) {
-				t.Fatalf("Arguments() error = %v, want containing %q", err, test.input)
+			if err == nil || !strings.Contains(err.Error(), test.input) || !strings.Contains(err.Error(), "Buildah backend") {
+				t.Fatalf("Arguments() error = %v, want Buildah rejection containing %q", err, test.input)
 			}
 		})
 	}
@@ -232,6 +299,11 @@ func TestArgumentsRejectsInvalidValues(t *testing.T) {
 			cfg.DisableCache = true
 			cfg.ImportCache = []string{"type=registry,ref=example/cache"}
 		}, message: "cache is disabled"},
+		{name: "cache directory", mutate: func(cfg *config.Config) { cfg.CacheDir = "/cache" }, message: "PLUGIN_CACHE_DIR"},
+		{name: "native storage", mutate: func(cfg *config.Config) { cfg.StorageDriver = "native" }, message: "PLUGIN_STORAGE_DRIVER"},
+		{name: "negative image retry", mutate: func(cfg *config.Config) { cfg.ImageDownloadRetry = -1 }, message: "PLUGIN_IMAGE_DOWNLOAD_RETRY"},
+		{name: "negative push retry", mutate: func(cfg *config.Config) { cfg.PushRetry = -1 }, message: "PLUGIN_PUSH_RETRY"},
+		{name: "empty buildah option", mutate: func(cfg *config.Config) { cfg.BuildahOpts = []string{" "} }, message: "PLUGIN_BUILDAH_OPT"},
 	}
 
 	for _, test := range tests {

@@ -30,10 +30,14 @@ func TestPrepareProxiesHarnessWorkspaceAndRewritesAbsoluteDockerfile(t *testing.
 	if plan.Context == workspace || !strings.HasPrefix(plan.Context, home+string(filepath.Separator)) {
 		t.Fatalf("Context = %q, want a private proxy under %q", plan.Context, home)
 	}
+	workspaceReal, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if target, err := os.Readlink(plan.Context); err != nil {
 		t.Fatalf("Context proxy is not a symlink: %v", err)
-	} else if target != workspace {
-		t.Fatalf("Context proxy target = %q, want %q", target, workspace)
+	} else if target != workspaceReal {
+		t.Fatalf("Context proxy target = %q, want %q", target, workspaceReal)
 	}
 	if want := filepath.Join("docker", "Dockerfile"); plan.Dockerfile != want {
 		t.Fatalf("Dockerfile = %q, want %q", plan.Dockerfile, want)
@@ -61,10 +65,14 @@ func TestPrepareUsesDroneWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Cleanup()
+	contextReal, err := filepath.EvalSymlinks(contextPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if target, err := os.Readlink(plan.Context); err != nil {
 		t.Fatal(err)
-	} else if target != contextPath {
-		t.Fatalf("proxy target = %q, want %q", target, contextPath)
+	} else if target != contextReal {
+		t.Fatalf("proxy target = %q, want %q", target, contextReal)
 	}
 }
 
@@ -80,10 +88,14 @@ func TestPrepareUsesValidWorkspaceWhenSecondaryWorkspaceIsMissing(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer plan.Cleanup()
+	workspaceReal, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if target, err := os.Readlink(plan.Context); err != nil {
 		t.Fatal(err)
-	} else if target != workspace {
-		t.Fatalf("proxy target = %q, want %q", target, workspace)
+	} else if target != workspaceReal {
+		t.Fatalf("proxy target = %q, want %q", target, workspaceReal)
 	}
 }
 
@@ -99,10 +111,14 @@ func TestPrepareFallsBackToStartupWorkingDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Cleanup()
+	workspaceReal, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if target, err := os.Readlink(plan.Context); err != nil {
 		t.Fatal(err)
-	} else if target != workspace {
-		t.Fatalf("proxy target = %q, want %q", target, workspace)
+	} else if target != workspaceReal {
+		t.Fatalf("proxy target = %q, want %q", target, workspaceReal)
 	}
 }
 
