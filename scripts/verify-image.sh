@@ -44,13 +44,19 @@ assert_equal() {
 	fi
 }
 
-assert_equal user 1000:1000 "$(inspect '{{.Config.User}}')"
+assert_equal user "${KIMIA_RUNTIME_USER}" "$(inspect '{{.Config.User}}')"
 assert_equal workdir /home/kimia "$(inspect '{{.Config.WorkingDir}}')"
 assert_equal architecture "${arch}" "$(inspect '{{.Architecture}}')"
 assert_equal entrypoint "[\"/usr/local/bin/kimia-${provider}\"]" "$(inspect '{{json .Config.Entrypoint}}')"
 
 tmpdir=$(inspect '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^TMPDIR=//p')
 assert_equal tmpdir "${KIMIA_TMPDIR}" "${tmpdir}"
+xdg_runtime_dir=$(inspect '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^XDG_RUNTIME_DIR=//p')
+assert_equal xdg-runtime-dir "${KIMIA_XDG_RUNTIME_DIR}" "${xdg_runtime_dir}"
+storage_conf=$(inspect '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^CONTAINERS_STORAGE_CONF=//p')
+assert_equal containers-storage-conf "${KIMIA_STORAGE_CONF}" "${storage_conf}"
+netavark_lock_path=$(inspect '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^NETAVARK_LOCK_PATH=//p')
+assert_equal netavark-lock-path "${KIMIA_NETAVARK_LOCK_PATH}" "${netavark_lock_path}"
 
 cmd=$(inspect '{{json .Config.Cmd}}')
 case "${cmd}" in
@@ -89,13 +95,11 @@ compat_target=$("${container_cli}" run --rm \
 	-c "readlink /kaniko/kaniko-${provider}")
 assert_equal Harness-entrypoint-target "/usr/local/bin/kimia-${provider}" "${compat_target}"
 
-if ! "${container_cli}" run --rm \
+kaniko_metadata=$("${container_cli}" run --rm \
 	--entrypoint /bin/sh \
 	"${image}" \
-	-c 'test ! -w /kaniko'; then
-	echo "${image}: /kaniko must not be writable by the runtime user" >&2
-	exit 1
-fi
+	-c "stat -c '%u:%g:%a' /kaniko")
+assert_equal Harness-entrypoint-directory 0:0:755 "${kaniko_metadata}"
 
 buildah_output=$("${container_cli}" run --rm --entrypoint buildah "${image}" --version)
 case "${buildah_output}" in
@@ -103,23 +107,39 @@ case "${buildah_output}" in
 	*) echo "${image}: unexpected Buildah version: ${buildah_output}" >&2; exit 1 ;;
 esac
 
+effective_storage=$("${container_cli}" run --rm \
+	--security-opt=no-new-privileges \
+	--entrypoint buildah \
+	"${image}" \
+	info --format '{{.store.GraphDriverName}}|{{.store.RunRoot}}')
+assert_equal effective-buildah-storage "${KIMIA_STORAGE_DRIVER}|${KIMIA_STORAGE_RUNROOT}" "${effective_storage}"
+
 if ! "${container_cli}" run --rm \
 	--entrypoint /bin/sh \
+	-e "KIMIA_EXPECTED_NETAVARK_LOCK_PATH=${KIMIA_NETAVARK_LOCK_PATH}" \
+	-e "KIMIA_EXPECTED_RUNTIME_USER=${KIMIA_RUNTIME_USER}" \
+	-e "KIMIA_EXPECTED_STORAGE_CONF=${KIMIA_STORAGE_CONF}" \
 	-e "KIMIA_EXPECTED_STORAGE_DRIVER=${KIMIA_STORAGE_DRIVER}" \
 	-e "KIMIA_EXPECTED_TMPDIR=${KIMIA_TMPDIR}" \
+	-e "KIMIA_EXPECTED_XDG_RUNTIME_DIR=${KIMIA_XDG_RUNTIME_DIR}" \
 	"${image}" \
 	-c '
 		set -eu
+		test "$(id -u):$(id -g)" = "${KIMIA_EXPECTED_RUNTIME_USER}"
+		test "$(stat -c "%u:%g" "${HOME}")" = "0:0"
+		test -w "${HOME}"
+		test -w "$(pwd)"
 		test "${TMPDIR}" = "${KIMIA_EXPECTED_TMPDIR}"
 		test -d "${TMPDIR}"
 		test -w "${TMPDIR}"
-		grep -Eq "^[[:space:]]*driver[[:space:]]*=[[:space:]]*\"${KIMIA_EXPECTED_STORAGE_DRIVER}\"[[:space:]]*$" /home/kimia/.config/containers/storage.conf
-		test -u /usr/bin/newuidmap
-		test -u /usr/bin/newgidmap
-		grep -qx "kimia:100000:65536" /etc/subuid
-		grep -qx "kimia:100000:65536" /etc/subgid
+		test "${XDG_RUNTIME_DIR}" = "${KIMIA_EXPECTED_XDG_RUNTIME_DIR}"
+		test "$(stat -c "%u:%g:%a" "${XDG_RUNTIME_DIR}")" = "0:0:700"
+		test "${NETAVARK_LOCK_PATH}" = "${KIMIA_EXPECTED_NETAVARK_LOCK_PATH}"
+		test "$(stat -c "%u:%g:%a" "${NETAVARK_LOCK_PATH%/*}")" = "0:0:700"
+		test "${CONTAINERS_STORAGE_CONF}" = "${KIMIA_EXPECTED_STORAGE_CONF}"
+		grep -Eq "^[[:space:]]*driver[[:space:]]*=[[:space:]]*\"${KIMIA_EXPECTED_STORAGE_DRIVER}\"[[:space:]]*$" "${CONTAINERS_STORAGE_CONF}"
 	'; then
-	echo "${image}: rootless Buildah VFS, setuid helper, or subordinate-ID contract is invalid" >&2
+	echo "${image}: rootful Buildah VFS runtime-directory contract is invalid" >&2
 	exit 1
 fi
 

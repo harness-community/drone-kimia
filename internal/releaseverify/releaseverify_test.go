@@ -106,6 +106,13 @@ func TestValidateConfig(t *testing.T) {
 	}{
 		{name: "architecture", mutate: func(config *v1.ConfigFile) { config.Architecture = "amd64" }, contains: "architecture"},
 		{name: "operating system", mutate: func(config *v1.ConfigFile) { config.OS = "windows" }, contains: "operating system"},
+		{name: "runtime user", mutate: func(config *v1.ConfigFile) { config.Config.User = "1000:1000" }, contains: "runtime user"},
+		{name: "missing XDG runtime directory", mutate: func(config *v1.ConfigFile) {
+			config.Config.Env = []string{"FIXTURE=value"}
+		}, contains: "XDG_RUNTIME_DIR is not configured"},
+		{name: "wrong XDG runtime directory", mutate: func(config *v1.ConfigFile) {
+			config.Config.Env = append(config.Config.Env, "XDG_RUNTIME_DIR=/run/user/1000")
+		}, contains: "XDG_RUNTIME_DIR is"},
 		{name: "entrypoint", mutate: func(config *v1.ConfigFile) { config.Config.Entrypoint = []string{"/usr/local/bin/kimia-ecr"} }, contains: "entrypoint"},
 		{name: "title", mutate: func(config *v1.ConfigFile) {
 			config.Config.Labels["org.opencontainers.image.title"] = "drone-kimia-ecr"
@@ -199,6 +206,66 @@ func TestVerifyCompatibilityEntrypoint(t *testing.T) {
 	}
 }
 
+func TestVerifyRuntimeDirectory(t *testing.T) {
+	valid := tar.Header{
+		Name:     "tmp/run/",
+		Typeflag: tar.TypeDir,
+		Mode:     0o700,
+		Uid:      0,
+		Gid:      0,
+	}
+
+	tests := []struct {
+		name     string
+		headers  []tar.Header
+		contains string
+	}{
+		{name: "directory", headers: []tar.Header{valid}},
+		{name: "missing", contains: "runtime directory /tmp/run is missing"},
+		{
+			name: "regular file",
+			headers: []tar.Header{{
+				Name:     "tmp/run",
+				Typeflag: tar.TypeReg,
+				Mode:     0o700,
+			}},
+			contains: "is not a directory",
+		},
+		{
+			name: "wrong owner",
+			headers: []tar.Header{{
+				Name:     "tmp/run/",
+				Typeflag: tar.TypeDir,
+				Mode:     0o700,
+				Uid:      1000,
+				Gid:      1000,
+			}},
+			contains: "owned by 1000:1000",
+		},
+		{
+			name: "wrong mode",
+			headers: []tar.Header{{
+				Name:     "tmp/run/",
+				Typeflag: tar.TypeDir,
+				Mode:     0o755,
+			}},
+			contains: "mode is 0755",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			image := fixtureFilesystemImage(t, test.headers...)
+			err := verifyRuntimeDirectory(image)
+			if test.contains == "" && err != nil {
+				t.Fatalf("verifyRuntimeDirectory() error = %v", err)
+			}
+			if test.contains != "" && (err == nil || !strings.Contains(err.Error(), test.contains)) {
+				t.Fatalf("verifyRuntimeDirectory() error = %v, want text %q", err, test.contains)
+			}
+		})
+	}
+}
+
 func TestArchitectureTag(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -231,6 +298,13 @@ func fixtureImage(t *testing.T, provider providerSpec, architecture, revision st
 	}
 	layer := fixtureLayer(t,
 		tar.Header{
+			Name:     "tmp/run/",
+			Typeflag: tar.TypeDir,
+			Mode:     0o700,
+			Uid:      0,
+			Gid:      0,
+		},
+		tar.Header{
 			Name:     "usr/local/bin/kimia-" + provider.name,
 			Typeflag: tar.TypeReg,
 			Mode:     0o755,
@@ -256,7 +330,11 @@ func fixtureConfig(provider providerSpec, architecture, revision string) *v1.Con
 		OS:           "linux",
 		Config: v1.Config{
 			Entrypoint: []string{"/usr/local/bin/kimia-" + provider.name},
-			Env:        []string{"FIXTURE=" + provider.name + "-" + architecture},
+			User:       expectedRuntimeUser,
+			Env: []string{
+				"FIXTURE=" + provider.name + "-" + architecture,
+				"XDG_RUNTIME_DIR=" + expectedXDGRuntimeDir,
+			},
 			Labels: map[string]string{
 				"org.opencontainers.image.title":    provider.title,
 				"org.opencontainers.image.revision": revision,

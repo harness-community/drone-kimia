@@ -16,6 +16,7 @@ repo_dir=$(CDPATH= cd -- "${script_dir}/.." && pwd)
 registry_image=${KIMIA_SMOKE_REGISTRY_IMAGE:-${SMOKE_REGISTRY_IMAGE}}
 output_dir=$(mktemp -d)
 workspace_dir=${output_dir}/harness
+shared_run_dir=${output_dir}/var-run
 registry_container=drone-kimia-smoke-registry-$$
 registry_network=drone-kimia-smoke-network-$$
 registry_started=false
@@ -35,11 +36,48 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "${workspace_dir}"
+run_harness_builder() {
+	"${container_cli}" run --rm \
+		--security-opt=no-new-privileges \
+		-v "${shared_run_dir}:/var/run" \
+		"$@"
+}
+
+mkdir -p "${workspace_dir}" "${shared_run_dir}"
 cp -R "${repo_dir}/testdata/smoke/." "${workspace_dir}/"
 chmod 0777 "${output_dir}" "${workspace_dir}"
+chmod 0755 "${shared_run_dir}"
+[ -z "$(find "${shared_run_dir}" -mindepth 1 -maxdepth 1 -print -quit)" ] || {
+	echo "${image}: Harness /var/run mount source must start empty" >&2
+	exit 1
+}
 
-"${container_cli}" run --rm \
+run_harness_builder \
+	--entrypoint /bin/sh \
+	-e "KIMIA_EXPECTED_NETAVARK_LOCK_PATH=${KIMIA_NETAVARK_LOCK_PATH}" \
+	-e "KIMIA_EXPECTED_RUNTIME_USER=${KIMIA_RUNTIME_USER}" \
+	-e "KIMIA_EXPECTED_STORAGE_CONF=${KIMIA_STORAGE_CONF}" \
+	-e "KIMIA_EXPECTED_STORAGE_DRIVER=${KIMIA_STORAGE_DRIVER}" \
+	-e "KIMIA_EXPECTED_STORAGE_RUNROOT=${KIMIA_STORAGE_RUNROOT}" \
+	-e "KIMIA_EXPECTED_XDG_RUNTIME_DIR=${KIMIA_XDG_RUNTIME_DIR}" \
+	"${image}" \
+	-c '
+		set -eu
+		test "$(id -u):$(id -g)" = "${KIMIA_EXPECTED_RUNTIME_USER}"
+		test "$(stat -c "%u:%g" "${HOME}")" = "0:0"
+		test -w "${HOME}"
+		test "${XDG_RUNTIME_DIR}" = "${KIMIA_EXPECTED_XDG_RUNTIME_DIR}"
+		test "$(stat -c "%u:%g:%a" "${XDG_RUNTIME_DIR}")" = "0:0:700"
+		test "${NETAVARK_LOCK_PATH}" = "${KIMIA_EXPECTED_NETAVARK_LOCK_PATH}"
+		test "$(stat -c "%u:%g:%a" "${NETAVARK_LOCK_PATH%/*}")" = "0:0:700"
+		test "${CONTAINERS_STORAGE_CONF}" = "${KIMIA_EXPECTED_STORAGE_CONF}"
+		test "$(buildah info --format "{{.store.GraphDriverName}}|{{.store.RunRoot}}")" = "${KIMIA_EXPECTED_STORAGE_DRIVER}|${KIMIA_EXPECTED_STORAGE_RUNROOT}"
+		test -d /var/run
+		test ! -e /var/run/user
+		grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+	'
+
+run_harness_builder \
 	--workdir /harness \
 	-v "${workspace_dir}:/harness" \
 	-e HARNESS_WORKSPACE=/harness \
@@ -52,7 +90,7 @@ chmod 0777 "${output_dir}" "${workspace_dir}"
 	--snapshot-mode redo \
 	--no-push
 
-"${container_cli}" run --rm \
+run_harness_builder \
 	--entrypoint /kaniko/kaniko-docker \
 	--workdir /harness \
 	-v "${workspace_dir}:/harness" \
@@ -108,7 +146,7 @@ network_created=true
 	"${registry_image}" >/dev/null
 registry_started=true
 
-"${container_cli}" run --rm \
+run_harness_builder \
 	--entrypoint /kaniko/kaniko-docker \
 	--workdir /harness \
 	--network "${registry_network}" \
@@ -144,7 +182,7 @@ printf '%s\n' "${normal_digest}" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
 
 push_attempt=1
 while :; do
-	if "${container_cli}" run --rm \
+	if run_harness_builder \
 		--entrypoint /kaniko/kaniko-docker \
 		--workdir /harness \
 		--network "${registry_network}" \
@@ -184,4 +222,9 @@ done
 	exit 1
 }
 
-echo "${image}: Buildah/VFS no-push, normal push, and unchanged Harness tar-to-push workflow verified"
+if [ -e "${shared_run_dir}/user" ]; then
+	echo "${image}: Buildah unexpectedly recreated /var/run/user in the Harness shared mount" >&2
+	exit 1
+fi
+
+echo "${image}: rootful Buildah/VFS build-only, tar, normal-push, and push-only paths passed with Harness /var/run and no-new-privileges"

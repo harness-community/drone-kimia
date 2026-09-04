@@ -5,7 +5,10 @@ ARG PLUGIN_REVISION=unknown
 ARG PLUGIN_CREATED=
 
 ENV KIMIA_VERSION=1.0.26 \
-    TMPDIR=/dev/shm
+    CONTAINERS_STORAGE_CONF=/home/kimia/.config/containers/storage.conf \
+    NETAVARK_LOCK_PATH=/tmp/lock/netavark.lock \
+    TMPDIR=/dev/shm \
+    XDG_RUNTIME_DIR=/tmp/run
 
 LABEL org.opencontainers.image.title="drone-kimia-acr" \
       org.opencontainers.image.description="Harness/Drone adapter for RapidFort Kimia using Azure Container Registry authentication" \
@@ -23,19 +26,27 @@ LABEL org.opencontainers.image.title="drone-kimia-acr" \
 COPY release/linux/arm64/kimia-acr /usr/local/bin/kimia-acr
 
 USER 0:0
-RUN mkdir -p /kaniko \
+RUN mkdir -p /kaniko "${XDG_RUNTIME_DIR}" "${NETAVARK_LOCK_PATH%/*}" \
+    && chown -R 0:0 /home/kimia "${XDG_RUNTIME_DIR}" "${NETAVARK_LOCK_PATH%/*}" \
+    && chmod 0700 "${XDG_RUNTIME_DIR}" "${NETAVARK_LOCK_PATH%/*}" \
     && chmod 0755 /kaniko \
     && ln -s /usr/local/bin/kimia-acr /kaniko/kaniko-acr
-USER 1000:1000
 
-RUN test "$(id -u):$(id -g)" = "1000:1000" \
+RUN test "$(id -u):$(id -g)" = "0:0" \
     && test "${HOME}" = "/home/kimia" \
+    && test "$(stat -c '%u:%g' "${HOME}")" = "0:0" \
+    && test -w "${HOME}" \
     && test "${TMPDIR}" = "/dev/shm" \
     && test -d "${TMPDIR}" \
     && test -w "${TMPDIR}" \
+    && test "${XDG_RUNTIME_DIR}" = "/tmp/run" \
+    && test "$(stat -c '%u:%g:%a' "${XDG_RUNTIME_DIR}")" = "0:0:700" \
+    && test "${NETAVARK_LOCK_PATH}" = "/tmp/lock/netavark.lock" \
+    && test "$(stat -c '%u:%g:%a' "${NETAVARK_LOCK_PATH%/*}")" = "0:0:700" \
     && test "$(pwd)" = "/home/kimia" \
+    && test -w "$(pwd)" \
     && test "$(readlink /kaniko/kaniko-acr)" = "/usr/local/bin/kimia-acr" \
-    && test ! -w /kaniko \
+    && test "$(stat -c '%u:%g:%a' /kaniko)" = "0:0:755" \
     && /usr/local/bin/kimia-acr --version \
     && /kaniko/kaniko-acr --version \
     && /usr/local/bin/kimia-acr --help | grep -q "PLUGIN_EXPAND_TAG" \
@@ -43,7 +54,7 @@ RUN test "$(id -u):$(id -g)" = "1000:1000" \
     && /usr/local/bin/kimia-acr --help | grep -q "PLUGIN_DAEMON_OFF" \
     && /usr/local/bin/kimia-acr --help | grep -q "SERVICE_PRINCIPAL_CLIENT_ID" \
     && buildah --version | grep -q "1.44.0" \
-    && grep -Eq '^[[:space:]]*driver[[:space:]]*=[[:space:]]*"vfs"[[:space:]]*$' /home/kimia/.config/containers/storage.conf \
+    && grep -Eq '^[[:space:]]*driver[[:space:]]*=[[:space:]]*"vfs"[[:space:]]*$' "${CONTAINERS_STORAGE_CONF}" \
     && test -u /usr/bin/newuidmap \
     && test -u /usr/bin/newgidmap \
     && grep -qx 'kimia:100000:65536' /etc/subuid \

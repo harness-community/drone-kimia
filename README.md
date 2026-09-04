@@ -19,9 +19,13 @@ The Buildah image replaces the earlier BuildKit package after RootlessKit could
 not start under the tested Harness Kubernetes security policy. The observed
 BuildKit behavior remains recorded in
 [`docs/harness-buildkit-findings.md`](docs/harness-buildkit-findings.md).
-Buildah removes RootlessKit and the private `buildkitd`, but it is not yet
-declared a universal or zero-setting Kaniko replacement: its rootless user
-namespace behavior still needs validation on the target Harness runners.
+The subsequent Buildah runtime diagnosis and selected image contract are in
+[`docs/harness-buildah-runtime-findings.md`](docs/harness-buildah-runtime-findings.md).
+Buildah removes RootlessKit and the private `buildkitd`. The provider images
+run Buildah as UID/GID `0:0`, with chroot isolation and VFS storage, so the
+image-override path does not depend on rootless setuid/user-namespace mapping.
+The new alpha image still needs validation on the target Harness runners
+before it is declared a universal Kaniko replacement.
 
 ## Images
 
@@ -34,11 +38,13 @@ namespace behavior still needs validation on the target Harness runners.
 
 Every image derives directly from the architecture-specific manifest of
 `ghcr.io/rapidfort/kimia-bud:1.0.26`. The image contains Buildah 1.44.0 and
-defaults to VFS storage. It also sets `TMPDIR=/dev/shm`, so Buildah 1.44's
-temporary context overlay is created on the standard OCI tmpfs instead of
-being nested on the container root filesystem's overlay. The version and
-immutable index/platform digests are recorded in [`versions.env`](versions.env);
-no image consumes an upstream `latest` tag.
+defaults to VFS storage. The derived image deliberately selects UID/GID `0:0`,
+sets `XDG_RUNTIME_DIR=/tmp/run`, and creates that directory as root with mode
+`0700`. It also sets `TMPDIR=/dev/shm`, so Buildah 1.44's temporary context
+overlay is created on the standard OCI tmpfs instead of being nested on the
+container root filesystem's overlay. The version and immutable index/platform
+digests are recorded in [`versions.env`](versions.env); no image consumes an
+upstream `latest` tag.
 
 The Buildah conversion does not add or alter release-pipeline steps, image
 repositories, tags, manifest topology, or compatibility entrypoints. Its
@@ -267,7 +273,10 @@ Kimia's archive-export path and skips the normal registry push. Setting
 explicitly and matches the existing Kaniko pipeline pattern. Harness already
 mounts `/harness` as the shared workspace for every step, so this
 workflow does not require another shared path or a `/home/kimia` path in the
-pipeline. The workspace must remain writable by the plugin's non-root UID 1000.
+pipeline. The existing `/var/run` shared path can also remain unchanged; the
+image uses `/tmp/run` for its private runtime directory, so that mount does not
+hide Buildah state. As with the existing build plugins, the Harness workspace
+must be writable by the step.
 
 The wrapper does not rely on Docker archive `RepoTags`. In a later step, it
 loads the single image and applies the repository and tags supplied by the
@@ -288,8 +297,8 @@ Push-only is implemented with the same `go-containerregistry` archive and
 registry flow used by `drone-kaniko`. It reuses the selected Docker, GAR, ECR,
 or ACR authentication, pushes directly over the registry API, and writes the
 normal digest, Harness artifact, and `DRONE_OUTPUT` results. It does not start
-Kimia, Buildah, or a Docker daemon and does not require Buildah's user-namespace
-operations. The source must be a regular, single-image Docker archive;
+Kimia, Buildah, or a Docker daemon and does not enter Buildah's build runtime.
+The source must be a regular, single-image Docker archive;
 zero-image or multi-image archives fail before any push.
 
 For a normal build-and-push, Kimia owns both `buildah bud` and the registry
@@ -514,8 +523,9 @@ hosts must match.
 Harness supplies explicit Kaniko entrypoints for its built-in build-and-push
 steps even when the backend image is overridden. Each Kimia provider image
 therefore exposes the matching `/kaniko/kaniko-*` compatibility path as a
-root-owned, read-only alias to the provider's Kimia wrapper. It does not invoke
-Kaniko or change the image's final non-root runtime contract.
+root-owned alias to the provider's Kimia wrapper. It does not invoke Kaniko.
+The provider image deliberately has a final UID/GID `0:0` runtime
+contract, matching the compatibility behavior described below.
 
 At the wrapper level, built-in Harness build-and-push steps do not require an
 `optimize`, context, tar-path, or shared-path workaround. Harness's injected
@@ -526,10 +536,10 @@ same shared workspace. Other nonempty engine-specific inputs remain explicit
 errors when they have no truthful Buildah equivalent.
 
 That input and filesystem compatibility does not prove runtime compatibility.
-The Buildah variant must still pass a zero-setting Harness run on each target
-runner class before it is treated as a drop-in. In particular, the image alias
-cannot change Kubernetes AppArmor, seccomp, user-namespace, capability, or
-`no_new_privs` policy.
+The revised Buildah variant must still pass a zero-setting Harness run on each
+target runner class before it is treated as a drop-in. The image no longer
+requires rootless subordinate-ID mapping, but its alias cannot change
+Kubernetes AppArmor, seccomp, capability, mount, or `no_new_privs` policy.
 
 VM steps may inject `PLUGIN_DAEMON_OFF=true`; Kimia accepts it because its
 Buildah flow is daemonless. Harness's separate DLC/Buildx execution
@@ -539,42 +549,46 @@ Kimia compatibility path and must not be overridden with these images.
 
 ## Runtime contract
 
-The plugin preserves the upstream Kimia image contract:
+The provider image keeps Kimia's Buildah tooling but deliberately changes the
+upstream rootless runtime contract for Kaniko-style Harness compatibility:
 
-- runtime user and group `1000:1000`
+- runtime user and group `0:0`
 - `HOME=/home/kimia`
 - `WORKDIR=/home/kimia`
+- `XDG_RUNTIME_DIR=/tmp/run`, owned by root with mode `0700`
 - Buildah 1.44.0 selected automatically by Kimia
-- VFS storage from `/home/kimia/.config/containers/storage.conf`
+- VFS storage explicitly selected through
+  `CONTAINERS_STORAGE_CONF=/home/kimia/.config/containers/storage.conf`
 - `TMPDIR=/dev/shm` for Buildah's temporary context-overlay scaffolding
 - chroot isolation selected by Kimia for `buildah bud`
-- setuid `/usr/bin/newuidmap` and `/usr/bin/newgidmap`
-- `kimia:100000:65536` ranges in `/etc/subuid` and `/etc/subgid`
 - no RootlessKit, private `buildkitd`, or Docker daemon
 
-The image does not add `privileged` mode or alter the upstream capability,
-seccomp, AppArmor, or user-namespace requirements. The runner must support the
-rootless user namespaces required by Kimia. Mounted contexts, cache volumes,
-and output volumes must be accessible to UID 1000.
+UID 0 inside the container is not Kubernetes privileged mode. The image cannot
+request `privileged: true`, add host access, or bypass the pod's capability,
+seccomp, AppArmor, namespace, mount, or `no_new_privs` policy. The default was
+changed because UID 1000 depends on setuid `newuidmap`/`newgidmap` behavior that
+is unavailable when Harness applies `allowPrivilegeEscalation: false`.
 
 VFS avoids using OverlayFS for image-layer storage and does not require
 `/dev/fuse`; chroot avoids the RootlessKit daemon startup path that failed in
 the earlier Harness test. Buildah 1.44 still creates a short-lived overlay over
 the build context, which is why the image directs its temporary scaffolding to
-`/dev/shm`. None of those choices removes Buildah's need to create user and
-mount namespaces for rootless builds and UID mapping. The runtime can still
-fail when setuid execution is disabled,
-SETUID/SETGID are removed, unprivileged user namespaces are disabled, seccomp
-blocks `clone`/`unshare`, or AppArmor restricts unprivileged user namespaces.
-`privileged: true` alone must not be assumed to correct those independent
-controls.
+`/dev/shm`. `XDG_RUNTIME_DIR=/tmp/run` keeps Buildah startup independent of
+Alpine's `/var/run -> /run` link when Harness mounts its shared `/var/run`
+volume. The image uses rootful Buildah within the container and therefore does
+not need subordinate UID/GID mapping for its default path. Dockerfile features
+can still fail if the runner removes operations they genuinely require.
 
 Before calling this image a Kaniko drop-in, validate on the actual Harness
-Kubernetes infrastructure with no extra stage settings: a simple build, a
-Dockerfile containing `RUN`, multi-stage and `COPY --chown` behavior,
-build-only, build-to-tar followed by push-only, authenticated pull and push,
-and registry caching. Until that matrix passes, the Buildah branch is an
-experimental packaging change rather than a confirmed seamless replacement.
+Kubernetes infrastructure with the existing stage configuration and no new
+security or shared-path settings: a simple build, a Dockerfile containing
+`RUN`, multi-stage and `COPY --chown` behavior, build-only, build-to-tar
+followed by push-only, authenticated pull and push, and registry caching. A
+local smoke reproduction has passed with `/var/run` mounted and
+`no-new-privileges`, but the target Harness alpha matrix remains required.
+See
+[`docs/harness-buildah-runtime-findings.md`](docs/harness-buildah-runtime-findings.md)
+for the observed failures, selected contract, and validation boundary.
 
 ## Development build
 
@@ -611,5 +625,6 @@ docker build \
 ```
 
 The derived Dockerfiles preserve `/usr/local/bin/kimia`, retain upstream's
-non-root user, and clear upstream's inherited `--help` command before setting
+home/work directory and VFS configuration, deliberately set the final runtime
+user to `0:0`, and clear upstream's inherited `--help` command before setting
 the provider wrapper as the entrypoint.

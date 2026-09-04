@@ -20,6 +20,8 @@ const (
 	// DefaultRepositoryPrefix is the Docker Hub namespace used by releases.
 	DefaultRepositoryPrefix = "docker.io/plugins"
 	verifiedImageCount      = 8
+	expectedRuntimeUser     = "0:0"
+	expectedXDGRuntimeDir   = "/tmp/run"
 )
 
 var (
@@ -128,6 +130,9 @@ func Verify(ctx context.Context, options Options) error {
 			if compatibilityErr := verifyCompatibilityEntrypoint(image, provider); compatibilityErr != nil {
 				return fmt.Errorf("validate release image %q: %w", reference, compatibilityErr)
 			}
+			if runtimeErr := verifyRuntimeDirectory(image); runtimeErr != nil {
+				return fmt.Errorf("validate release image %q: %w", reference, runtimeErr)
+			}
 			digest, digestErr := image.Digest()
 			if digestErr != nil {
 				return fmt.Errorf("read release image digest %q: %w", reference, digestErr)
@@ -184,6 +189,16 @@ func validateConfig(provider providerSpec, architecture, revision string, config
 	if config.OS != "linux" {
 		return fmt.Errorf("operating system is %q, expected %q", config.OS, "linux")
 	}
+	if config.Config.User != expectedRuntimeUser {
+		return fmt.Errorf("runtime user is %q, expected %q", config.Config.User, expectedRuntimeUser)
+	}
+	xdgRuntimeDir, ok := environmentValue(config.Config.Env, "XDG_RUNTIME_DIR")
+	if !ok {
+		return fmt.Errorf("XDG_RUNTIME_DIR is not configured, expected %q", expectedXDGRuntimeDir)
+	}
+	if xdgRuntimeDir != expectedXDGRuntimeDir {
+		return fmt.Errorf("XDG_RUNTIME_DIR is %q, expected %q", xdgRuntimeDir, expectedXDGRuntimeDir)
+	}
 	expectedEntrypoint := "/usr/local/bin/kimia-" + provider.name
 	if len(config.Config.Entrypoint) != 1 || config.Config.Entrypoint[0] != expectedEntrypoint {
 		return fmt.Errorf("entrypoint is %q, expected [%q]", config.Config.Entrypoint, expectedEntrypoint)
@@ -199,11 +214,23 @@ func validateConfig(provider providerSpec, architecture, revision string, config
 	return nil
 }
 
+func environmentValue(environment []string, name string) (string, bool) {
+	prefix := name + "="
+	for index := len(environment) - 1; index >= 0; index-- {
+		if strings.HasPrefix(environment[index], prefix) {
+			return strings.TrimPrefix(environment[index], prefix), true
+		}
+	}
+	return "", false
+}
+
 type filesystemEntry struct {
 	found    bool
 	typeflag byte
 	linkname string
 	mode     int64
+	uid      int
+	gid      int
 }
 
 func verifyCompatibilityEntrypoint(image v1.Image, provider providerSpec) error {
@@ -247,6 +274,38 @@ func verifyCompatibilityEntrypoint(image v1.Image, provider providerSpec) error 
 		}
 	default:
 		return fmt.Errorf("Harness compatibility entrypoint /%s is not a symlink or executable file", aliasPath)
+	}
+	return nil
+}
+
+func verifyRuntimeDirectory(image v1.Image) error {
+	const runtimeDirectory = "tmp/run"
+	entries, err := finalFilesystemEntries(image, []string{runtimeDirectory})
+	if err != nil {
+		return fmt.Errorf("inspect runtime directory filesystem: %w", err)
+	}
+
+	runtime := entries[runtimeDirectory]
+	if !runtime.found {
+		return fmt.Errorf("runtime directory /%s is missing", runtimeDirectory)
+	}
+	if runtime.typeflag != tar.TypeDir {
+		return fmt.Errorf("runtime directory /%s is not a directory", runtimeDirectory)
+	}
+	if runtime.uid != 0 || runtime.gid != 0 {
+		return fmt.Errorf(
+			"runtime directory /%s is owned by %d:%d, expected 0:0",
+			runtimeDirectory,
+			runtime.uid,
+			runtime.gid,
+		)
+	}
+	if runtime.mode&0o7777 != 0o700 {
+		return fmt.Errorf(
+			"runtime directory /%s mode is %04o, expected 0700",
+			runtimeDirectory,
+			runtime.mode&0o7777,
+		)
 	}
 	return nil
 }
@@ -310,6 +369,8 @@ func scanLayer(layer v1.Layer, targets map[string]struct{}) (map[string]filesyst
 				typeflag: header.Typeflag,
 				linkname: header.Linkname,
 				mode:     header.Mode,
+				uid:      header.Uid,
+				gid:      header.Gid,
 			}
 		}
 		for target := range targets {
