@@ -1,180 +1,208 @@
 # Kimia Buildah on Harness: Runtime Findings
 
-- Status: root cause confirmed on 2026-09-04
-- Scope: RapidFort Kimia `v1.0.26`, Buildah 1.44.0, Harness CI with
+- Status: confirmed on Harness on 2026-09-04
+- Scope: RapidFort Kimia `v1.0.26`, Buildah 1.44.0, and Harness CI with
   `KubernetesDirect` infrastructure
-- Decision: package the compatibility image with UID/GID `0:0`,
-  `XDG_RUNTIME_DIR=/tmp/run`, chroot isolation, and VFS storage
+- Decision: use the rootful Buildah image contract and require
+  `containerSecurityContext.privileged: true` for every Harness step that
+  builds an image
 
-## Summary
+## Result
 
-All three Harness runs reached `/kaniko/kaniko-docker`, the `drone-kimia`
-wrapper, and Kimia successfully. They then failed before the Dockerfile was
-executed with the same error:
+The corrected Kimia Buildah image successfully completed the Harness
+build-only workflow, including a Dockerfile `RUN` instruction and Docker
+archive export, when the stage was privileged.
 
-```text
-time="..." level=error msg="lstat /run/user: no such file or directory"
-[FATAL] build failed: buildah build failed: exit status 1
-drone-kimia: Kimia build failed: exit status 1
+Use this infrastructure setting:
+
+```yaml
+infrastructure:
+  type: KubernetesDirect
+  spec:
+    containerSecurityContext:
+      privileged: true
 ```
 
-Changing `privileged` or `allowPrivilegeEscalation` did not affect this error.
-It is a filesystem/runtime-directory problem, not proof that any of the tested
-security contexts is insufficient.
+`allowPrivilegeEscalation: true` is not required as a separate setting.
+Kubernetes treats privilege escalation as enabled for a privileged container.
+Setting `allowPrivilegeEscalation: true` without granting the mount capability
+does not make an otherwise non-privileged Buildah build work.
 
-The stage's existing `/var/run` shared path must remain unchanged. Alpine maps
-`/var/run` to `/run`; mounting the shared volume at `/var/run` therefore hides
-the image's baked `/run/user/1000` directory. The upstream Kimia Buildah image
-also exports `XDG_RUNTIME_DIR=/run/user/1000`, so Buildah tries to resolve the
-now-hidden parent directory during startup.
+No other pipeline workaround is required:
 
-Moving `XDG_RUNTIME_DIR` to `/tmp/run` avoids the shared mount. A second,
-independent issue then appears when the image remains UID/GID `1000:1000` and
-the runtime applies `no_new_privs` (the effect required by
-`allowPrivilegeEscalation: false`): the setuid `newuidmap` and `newgidmap`
-helpers cannot acquire the capabilities needed for rootless UID/GID mapping.
-The rootless fallback subsequently fails while setting supplemental groups.
+- keep the existing `/var/run` shared path;
+- keep the normal Harness context and relative tar paths;
+- do not add `/home/kimia` paths;
+- do not set `optimize: false`; and
+- continue to replace the plugin image and use the existing plugin inputs.
 
-For Kaniko-style image-override compatibility, the selected image contract is
-therefore root inside the container (`0:0`), not rootless Buildah. This does
-not make the Kubernetes container privileged and does not add host access or
-capabilities. It lets Buildah use the permissions already available to the
-container without relying on setuid escalation from UID 1000.
+This makes the image compatible with the Kaniko entrypoint and input contract,
+but not with Kaniko's non-privileged security contract.
 
-## Tested Harness settings
+## Harness evidence
 
-The existing stage also had `sharedPaths: [/var/run]` in every case. That is
-normal Harness configuration and is not a pipeline mistake.
+### Initial image: runtime-directory failure
 
-| Case | `privileged` | `allowPrivilegeEscalation` | Result |
-| --- | --- | --- | --- |
-| 1 | `false` | `false` | `lstat /run/user: no such file or directory` |
-| 2 | `false` | `true` | Same error |
-| 3 | `true` | `true` | Same error |
+Before the image packaging was corrected, all three security-context variants
+failed during Buildah initialization:
 
-Common successful startup before the failure:
+| `privileged` | `allowPrivilegeEscalation` | Result |
+| --- | --- | --- |
+| `false` | `false` | `lstat /run/user: no such file or directory` |
+| `false` | `true` | Same error |
+| `true` | `true` | Same error |
+
+Harness mounts the shared `/var/run` path over Alpine's `/var/run -> /run`
+link. That hides the upstream image's `/run/user/1000` directory. Moving
+`XDG_RUNTIME_DIR` to `/tmp/run` fixed this packaging problem. Running the image
+as UID/GID `0:0` also avoids the rootless subordinate-ID setup that fails when
+`no_new_privs` prevents the setuid mapping helpers from acquiring capabilities.
+
+### Corrected image, non-privileged stage
+
+With neither privileged mode nor privilege escalation enabled, the corrected
+image passed the entrypoint, context, authentication, and Buildah startup
+paths. It then failed at Buildah's context-overlay mount, before the first
+Dockerfile step:
 
 ```text
-Plugin entrypoint specified
-[INFO] Kimia - Kubernetes-Native OCI Image Builder v1.0.26
 [INFO] Detected builder: BUILDAH
 [INFO] Build context prepared at: /home/kimia/.drone-kimia-.../context
 [INFO] Authentication configured: 1 direct auths, 0 helpers, global store: false
-[INFO] Using builder: BUILDAH
-[INFO] Starting buildah build...
 [INFO]   BUILDAH_ISOLATION=chroot
 [INFO] Executing: buildah bud ...
+
+Error: mounting an overlay over build context directory: creating overlay
+scaffolding for build context directory: mount overlay:/dev/shm/buildah-context-...,
+data: lowerdir=/harness,upperdir=...,workdir=...,userxattr: permission denied
+
+[FATAL] build failed: buildah build failed: exit status 125
 ```
 
-This confirms that the compatibility entrypoint, input conversion,
-authentication setup, and workspace preparation completed. The failure begins
-inside Buildah initialization.
+This later error confirms that the `/run/user` fix worked. The remaining
+failure is a Buildah mount-permission requirement, not a drone-kimia
+entrypoint, authentication, context-path, or tar-path problem.
 
-## Why `/run/user` fails
+### Corrected image, privileged stage
 
-The effective filesystem relationship is:
+With only `privileged: true` selected, the same build completed:
 
 ```text
-/var/run -> /run
-Harness shared volume mounted at /var/run
-  -> mount resolves to /run
-  -> image content under /run is hidden
-  -> /run/user/1000 is no longer visible
+STEP 1/3: FROM alpine:latest
+STEP 2/3: RUN apk add --no-cache bash
+STEP 3/3: CMD ["bash"]
+COMMIT .../test:test
+[INFO] Build completed successfully
+[INFO] Exporting image to TAR: /home/kimia/.drone-kimia-.../output/image.tar
+[INFO] Successfully exported using direct buildah push
+[INFO] No push requested, skipping image push to registries
+[INFO] Build completed successfully!
 ```
 
-The relevant process path for the original UID 1000 image is:
+This validates the compatibility entrypoint, input conversion, registry
+authentication setup, workspace proxy, Buildah build, and build-to-tar path on
+the tested Harness runner.
 
-```text
-Kimia executes buildah bud
-  -> Buildah mainInit calls storage.DefaultStoreOptions
-  -> containers/storage selects rootless storage options
-  -> homedir.GetRuntimeDir reads XDG_RUNTIME_DIR
-  -> filepath.EvalSymlinks("/run/user/1000")
-  -> lstat /run/user fails
-```
+## Root cause
 
-This lookup happens while Buildah initializes, before `bud` evaluates the
-Dockerfile and before its chroot isolation setting can help. It also explains
-why all three security-context variants produced the same result.
+Kimia executes `buildah bud` with the prepared context. drone-kimia exposes the
+Harness workspace through a private symlink under `/home/kimia`; Buildah
+resolves that symlink, which is why its diagnostic correctly reports
+`lowerdir=/harness`.
 
-## Why the rootless image is not the drop-in contract
+Buildah 1.44.0 then unconditionally creates and mounts a short-lived overlay
+over the build context. This happens before Dockerfile instructions are run.
+The overlay is independent of the configured image-layer storage driver:
 
-Overriding `XDG_RUNTIME_DIR=/tmp/run` fixes the first failure. An exact local
-reproduction with UID/GID `1000:1000`, the `/var/run` mount, and
-`no-new-privileges` then reached rootless ID mapping and failed with:
+- VFS controls Buildah's image and layer storage, not this context overlay;
+- chroot controls Dockerfile `RUN` isolation, not this context overlay;
+- `TMPDIR=/dev/shm` relocates the overlay scaffolding but does not grant mount
+  permission; and
+- copying, moving, or symlinking the context cannot disable the mount.
 
-```text
-newgidmap: Could not set caps
-newuidmap: Could not set caps
-Falling back to single mapping
-error setting supplemental groups list: operation not permitted
-```
+The native overlay mount requires mount authority such as `CAP_SYS_ADMIN`.
+UID 0 inside a container does not grant that capability by itself.
+`allowPrivilegeEscalation` controls `no_new_privs`; it does not add
+`CAP_SYS_ADMIN`. Privileged mode works because Kubernetes grants the container
+all Linux capabilities and relaxes the runtime security restrictions that
+otherwise block the mount.
 
-This is expected when setuid helpers execute under `no_new_privs`: they cannot
-gain the capabilities used to install subordinate UID/GID mappings. Buildah
-1.44.0 then falls back to a single mapping, whose supplemental-group setup is
-also denied. Enabling privilege escalation or modifying node policy would be a
-pipeline/runner workaround, not a seamless Kaniko image replacement.
+Buildah 1.44.0 has no CLI, environment, or containers configuration option to
+disable this context-overlay path. Kimia has no input that can remove the
+requirement. The exact VFS-and-chroot behavior is tracked in the open upstream
+[Buildah issue 6910](https://github.com/podman-container-tools/buildah/issues/6910).
 
-This single-mapping failure is tracked in Buildah issue 6947 and its fix was
-released in Buildah 1.45.0. Kimia `v1.0.26` contains Buildah 1.44.0, so the
-root-default contract is the compatible choice for the currently pinned Kimia
-release; a future Kimia update can be reevaluated separately.
+## Direct Buildah behavior
+
+This requirement comes from Buildah itself. Running the matching Buildah
+version directly in the same Harness pod policy reaches the same mount
+boundary; replacing drone-kimia with another thin Buildah wrapper does not
+remove it. The Drone Buildah plugin likewise documents `SYS_ADMIN` as a
+required container capability.
+
+Privileged mode is not a universal requirement for every Buildah deployment.
+A runner with a correctly configured user namespace or FUSE overlay path can
+support other configurations, and a platform that exposes precise capability
+controls may be able to grant a narrower runtime contract. On the tested
+Harness runner, however, `privileged: true` is the only verified and exposed
+configuration that works. It is therefore the supported setting for this
+plugin iteration.
+
+## Operation matrix
+
+| Plugin operation | Starts Buildah build | Harness requirement |
+| --- | --- | --- |
+| Normal build and push | Yes | `privileged: true` |
+| Build only with `no_push` | Yes | `privileged: true` |
+| Build and Docker tar export | Yes | `privileged: true` |
+| Push only from an existing tar | No | No Buildah mount requirement |
+
+Push-only is implemented by drone-kimia with `go-containerregistry`; it does
+not start Kimia or Buildah. If build-only and push-only steps share one Harness
+stage security context, the stage will still be privileged because the build
+step requires it.
 
 ## Selected image contract
 
-The provider images use the following runtime contract:
+The provider images retain these packaging choices:
 
 | Property | Selected value | Reason |
 | --- | --- | --- |
 | Container user | `0:0` | Avoid rootless setuid/user-namespace mapping under `no_new_privs` |
-| Privileged mode | Not requested | Image metadata does not grant Kubernetes privileged mode |
-| Privilege escalation | Not required by the validated simple build | Compatible with `allowPrivilegeEscalation: false` for the tested path |
-| Runtime directory | `/tmp/run`, owner `0:0`, mode `0700` | Independent of Harness's `/var/run` mount and valid for one user |
+| Runtime directory | `/tmp/run`, owner `0:0`, mode `0700` | Remain independent of the Harness `/var/run` mount |
 | Build isolation | `chroot` | Kimia's packaged Buildah path |
-| Storage driver | `vfs`, explicitly selected with `CONTAINERS_STORAGE_CONF` | Avoid OverlayFS/FUSE and system-config differences |
-| Temporary directory | `/dev/shm` | Keep Buildah temporary scaffolding off the container root overlay |
+| Image-layer storage | VFS through `CONTAINERS_STORAGE_CONF` | Avoid an OverlayFS/FUSE dependency for Buildah's persistent layer store |
+| Temporary directory | `/dev/shm` | Keep temporary context-overlay scaffolding off the container root filesystem |
+| Harness security context | `privileged: true` | Permit Buildah 1.44's mandatory context-overlay mount |
 
-Root inside a container and a privileged container are different security
-states. UID 0 remains limited by the pod's capability set, seccomp/AppArmor
-profiles, namespaces, read-only mounts, and volume permissions. This choice is
-still a security-posture change from the original Kimia rootless image and
-must be reviewed as such; it is selected because the compatibility target is
-the existing root-running Kaniko execution model without requesting
-`privileged: true`.
+Root inside the image and a privileged Kubernetes container remain distinct
+security states. The image metadata supplies UID 0 but cannot grant Kubernetes
+privilege. Harness must set the stage security context explicitly.
 
-## Validation evidence and remaining scope
+## Compatibility classification
 
-Local container reproduction covered the same critical conditions:
+The tested Buildah image is:
 
-| Runtime | `/var/run` mounted | `no-new-privileges` | Result |
-| --- | --- | --- | --- |
-| UID 1000, upstream XDG path | Yes | Either | Fails at `/run/user` lookup |
-| UID 1000, `XDG_RUNTIME_DIR=/tmp/run` | Yes | Yes | Fails at rootless UID/GID mapping |
-| UID 0, `XDG_RUNTIME_DIR=/tmp/run` | Yes | Yes | Builds a Dockerfile containing `RUN apk add --no-cache bash` |
+- compatible with Harness's injected `/kaniko/kaniko-*` entrypoints;
+- compatible with existing Kaniko/Docker plugin inputs covered by the adapter;
+- compatible with connector-derived registry authentication passed as plugin
+  environment variables;
+- compatible with the existing `/harness` context, `/var/run` shared path, and
+  relative tar paths; and
+- not a non-privileged Kaniko drop-in.
 
-The final provider images and release checks should preserve that last case as
-a smoke test. It verifies the observed filesystem and `no_new_privs`
-interaction, but does not replace target Harness validation across node
-images, pod policies, Dockerfile features, architectures, registries, cache,
-tar export, and push-only flows.
-
-No `.harness` or pipeline change is required for this fix. In particular:
-
-- keep the existing `/var/run` shared path;
-- do not add `privileged: true`;
-- do not add an `allowPrivilegeEscalation` override;
-- do not add `/home/kimia`, `/tmp/run`, or special context/tar paths to the
-  pipeline; and
-- test the new alpha image by replacing only the plugin image.
+Further validation is still required for every provider and target runner
+class, including normal authenticated push, ECR, GAR, ACR, caching,
+multi-stage Dockerfiles, `COPY --chown`, amd64, and arm64. The successful
+Docker-registry build-only and tar-export run establishes the base Harness
+runtime contract.
 
 ## References
 
-- [Kimia v1.0.26 Buildah image definition](https://github.com/rapidfort/kimia/blob/v1.0.26/Dockerfile.buildah#L157-L175)
-- [Buildah 1.44.0 startup initialization](https://github.com/containers/buildah/blob/v1.44.0/cmd/buildah/main.go#L84-L101)
-- [containers/storage runtime-directory selection](https://github.com/containers/storage/blob/main/types/options.go#L281-L305)
-- [containers/storage `XDG_RUNTIME_DIR` resolution](https://github.com/containers/storage/blob/main/pkg/homedir/homedir_unix.go#L136-L181)
-- [Buildah 1.44 rootless UID/GID mapping requirements](https://github.com/containers/buildah/blob/v1.44.0/docs/tutorials/05-openshift-rootless-build.md#L127-L136)
-- [Buildah issue 6947: `no_new_privs` single-mapping failure](https://github.com/containers/buildah/issues/6947)
-- [Buildah 1.45.0 release](https://github.com/podman-container-tools/buildah/releases/tag/v1.45.0)
-- [XDG runtime-directory requirements](https://specifications.freedesktop.org/basedir/0.8/#variables)
+- [Kimia v1.0.26 Buildah command construction](https://github.com/rapidfort/kimia/blob/v1.0.26/src/internal/build/builder.go#L159-L343)
+- [Buildah 1.44.0 context-overlay setup](https://github.com/podman-container-tools/buildah/blob/v1.44.0/imagebuildah/build_linux.go#L20-L85)
+- [Buildah 1.44.0 unconditional setup call](https://github.com/podman-container-tools/buildah/blob/v1.44.0/imagebuildah/build.go#L291-L317)
+- [Buildah issue 6910: VFS/chroot context-overlay behavior](https://github.com/podman-container-tools/buildah/issues/6910)
+- [Drone Buildah capability example](https://github.com/drone-plugins/drone-buildah/blob/master/README.md#L61-L71)
+- [Kubernetes container security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)
+- [Buildah issue 6947: `no_new_privs` single-mapping failure](https://github.com/podman-container-tools/buildah/issues/6947)

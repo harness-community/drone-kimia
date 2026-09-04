@@ -24,8 +24,10 @@ The subsequent Buildah runtime diagnosis and selected image contract are in
 Buildah removes RootlessKit and the private `buildkitd`. The provider images
 run Buildah as UID/GID `0:0`, with chroot isolation and VFS storage, so the
 image-override path does not depend on rootless setuid/user-namespace mapping.
-The new alpha image still needs validation on the target Harness runners
-before it is declared a universal Kaniko replacement.
+Harness validation confirmed that every operation which invokes `buildah bud`
+requires `containerSecurityContext.privileged: true` on the tested
+`KubernetesDirect` runner. The image is therefore not a configuration-free or
+non-privileged Kaniko replacement.
 
 ## Images
 
@@ -42,9 +44,10 @@ defaults to VFS storage. The derived image deliberately selects UID/GID `0:0`,
 sets `XDG_RUNTIME_DIR=/tmp/run`, and creates that directory as root with mode
 `0700`. It also sets `TMPDIR=/dev/shm`, so Buildah 1.44's temporary context
 overlay is created on the standard OCI tmpfs instead of being nested on the
-container root filesystem's overlay. The version and immutable index/platform
-digests are recorded in [`versions.env`](versions.env); no image consumes an
-upstream `latest` tag.
+container root filesystem's overlay. This changes only the scaffolding
+location; it does not remove the overlay mount or its privilege requirement.
+The version and immutable index/platform digests are recorded in
+[`versions.env`](versions.env); no image consumes an upstream `latest` tag.
 
 The Buildah conversion does not add or alter release-pipeline steps, image
 repositories, tags, manifest topology, or compatibility entrypoints. Its
@@ -230,7 +233,9 @@ The wrapper invokes the equivalent of:
 
 This validates and executes the build, but it does not load the result into a
 Docker daemon. Kimia detects Buildah and runs `buildah bud` with its chroot
-isolation default. Use tar export when the built image must be retained locally.
+isolation default. On the tested Harness Kubernetes runner this operation
+requires stage-level `containerSecurityContext.privileged: true`. Use tar
+export when the built image must be retained locally.
 
 ## Tar export and push-only
 
@@ -276,7 +281,8 @@ workflow does not require another shared path or a `/home/kimia` path in the
 pipeline. The existing `/var/run` shared path can also remain unchanged; the
 image uses `/tmp/run` for its private runtime directory, so that mount does not
 hide Buildah state. As with the existing build plugins, the Harness workspace
-must be writable by the step.
+must be writable by the step. Build-to-tar begins with `buildah bud` and has
+the same `privileged: true` requirement as a normal build.
 
 The wrapper does not rely on Docker archive `RepoTags`. In a later step, it
 loads the single image and applies the repository and tags supplied by the
@@ -298,8 +304,11 @@ registry flow used by `drone-kaniko`. It reuses the selected Docker, GAR, ECR,
 or ACR authentication, pushes directly over the registry API, and writes the
 normal digest, Harness artifact, and `DRONE_OUTPUT` results. It does not start
 Kimia, Buildah, or a Docker daemon and does not enter Buildah's build runtime.
-The source must be a regular, single-image Docker archive;
-zero-image or multi-image archives fail before any push.
+It therefore has no inherent Buildah privilege requirement. If it shares a
+stage security context with the build-to-tar step, the stage remains
+privileged because the build step requires it. The source must be a regular,
+single-image Docker archive; zero-image or multi-image archives fail before
+any push.
 
 For a normal build-and-push, Kimia owns both `buildah bud` and the registry
 push. Kimia v1.0.26 reports Buildah's config-blob digest through its digest
@@ -488,8 +497,21 @@ Kubernetes nodes.
 
 ## Migrating by image override
 
-Keep the existing Harness step settings and change only the plugin image when
-all configured inputs appear in the compatible-input table above:
+Keep the existing Harness step inputs when all configured inputs appear in the
+compatible-input table above. Change the plugin image and enable privileged
+mode at the Harness stage for every operation that builds an image:
+
+```yaml
+infrastructure:
+  type: KubernetesDirect
+  spec:
+    containerSecurityContext:
+      privileged: true
+```
+
+No separate `allowPrivilegeEscalation` setting is required. Enabling privilege
+escalation alone is not a substitute for privileged mode on the tested runner.
+Then use the corresponding replacement image:
 
 | Existing image | Kimia replacement |
 | --- | --- |
@@ -535,11 +557,11 @@ existing `/harness` context to Kimia and returns relative tar outputs to that
 same shared workspace. Other nonempty engine-specific inputs remain explicit
 errors when they have no truthful Buildah equivalent.
 
-That input and filesystem compatibility does not prove runtime compatibility.
-The revised Buildah variant must still pass a zero-setting Harness run on each
-target runner class before it is treated as a drop-in. The image no longer
-requires rootless subordinate-ID mapping, but its alias cannot change
-Kubernetes AppArmor, seccomp, capability, mount, or `no_new_privs` policy.
+That input and filesystem compatibility is separate from the runtime security
+contract. Harness testing confirmed that Buildah 1.44's context-overlay mount
+fails in a non-privileged stage and succeeds with `privileged: true`. The image
+no longer requires rootless subordinate-ID mapping, but its alias cannot grant
+Kubernetes capabilities or alter AppArmor, seccomp, namespace, or mount policy.
 
 VM steps may inject `PLUGIN_DAEMON_OFF=true`; Kimia accepts it because its
 Buildah flow is daemonless. Harness's separate DLC/Buildx execution
@@ -565,28 +587,32 @@ upstream rootless runtime contract for Kaniko-style Harness compatibility:
 
 UID 0 inside the container is not Kubernetes privileged mode. The image cannot
 request `privileged: true`, add host access, or bypass the pod's capability,
-seccomp, AppArmor, namespace, mount, or `no_new_privs` policy. The default was
-changed because UID 1000 depends on setuid `newuidmap`/`newgidmap` behavior that
-is unavailable when Harness applies `allowPrivilegeEscalation: false`.
+seccomp, AppArmor, namespace, mount, or `no_new_privs` policy. Harness must
+supply `containerSecurityContext.privileged: true` for build operations. No
+separate `allowPrivilegeEscalation` override is required when the container is
+privileged. The image default was changed because UID 1000 also depends on
+setuid `newuidmap`/`newgidmap` behavior that is unavailable when Harness applies
+`allowPrivilegeEscalation: false`.
 
-VFS avoids using OverlayFS for image-layer storage and does not require
-`/dev/fuse`; chroot avoids the RootlessKit daemon startup path that failed in
-the earlier Harness test. Buildah 1.44 still creates a short-lived overlay over
-the build context, which is why the image directs its temporary scaffolding to
-`/dev/shm`. `XDG_RUNTIME_DIR=/tmp/run` keeps Buildah startup independent of
-Alpine's `/var/run -> /run` link when Harness mounts its shared `/var/run`
-volume. The image uses rootful Buildah within the container and therefore does
-not need subordinate UID/GID mapping for its default path. Dockerfile features
-can still fail if the runner removes operations they genuinely require.
+VFS avoids OverlayFS for persistent image-layer storage and does not require
+`/dev/fuse` for that store; chroot avoids the RootlessKit daemon startup path
+that failed in the earlier Harness test. Buildah 1.44 separately creates a
+short-lived overlay over every build context. Directing its scaffolding to
+`/dev/shm` does not remove that mount or the required mount capability. This
+upstream behavior is why the tested Harness runner requires privileged mode
+even with VFS and chroot. `XDG_RUNTIME_DIR=/tmp/run` keeps Buildah startup
+independent of Alpine's `/var/run -> /run` link when Harness mounts its shared
+`/var/run` volume. The image uses rootful Buildah and therefore does not need
+subordinate UID/GID mapping for its default path.
 
-Before calling this image a Kaniko drop-in, validate on the actual Harness
-Kubernetes infrastructure with the existing stage configuration and no new
-security or shared-path settings: a simple build, a Dockerfile containing
-`RUN`, multi-stage and `COPY --chown` behavior, build-only, build-to-tar
-followed by push-only, authenticated pull and push, and registry caching. A
-local smoke reproduction has passed with `/var/run` mounted and
-`no-new-privileges`, but the target Harness alpha matrix remains required.
-See
+Actual Harness testing established the base contract: non-privileged build-only
+failed at the context-overlay mount, while the same Dockerfile and tar export
+succeeded with `privileged: true`. Continue validation under that security
+setting for multi-stage and `COPY --chown` behavior, normal authenticated push,
+push-only, registry caching, all provider flows, and both architectures. A
+local smoke reproduction with `/var/run` mounted and `no-new-privileges` is
+host-specific evidence and does not establish non-privileged compatibility on
+the target Harness runner. See
 [`docs/harness-buildah-runtime-findings.md`](docs/harness-buildah-runtime-findings.md)
 for the observed failures, selected contract, and validation boundary.
 
@@ -609,7 +635,8 @@ sh scripts/docker.sh
 
 That command also verifies every provider image contract and runs the Docker
 variant through Buildah/VFS build-only, normal build-and-push, tar export, and
-push-only smoke paths without adding container security flags.
+push-only smoke paths. This local smoke is a packaging regression test; the
+supported Harness build contract still requires stage-level privileged mode.
 
 Set `KIMIA_IMAGE_ARCH=amd64|arm64` to select an architecture explicitly and
 `KIMIA_CONTAINER_CLI` to use a Docker-compatible CLI other than `docker`.
